@@ -1,0 +1,10 @@
+{
+    "system_prompt": "You are a helpful AI assistant. You are concise and to the point.",
+    "random_mode": false,
+    "thinking_enabled": false,
+    "grounding_enabled": true,
+    "llm_provider": "LMSTUDIO",
+    "gemini_model": "gemini-2.0-flash",
+    "run_in_background": false,
+    "max_history": 15
+}

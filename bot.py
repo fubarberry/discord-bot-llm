@@ -73,13 +73,18 @@ class LLMBot(commands.Bot):
             return []
 
     def load_settings(self) -> dict:
-        """Loads settings from settings.json."""
+        """Loads settings from settings.json (falls back to settings.json.example)."""
         try:
             with open("settings.json", "r") as f:
                 return json.load(f)
         except FileNotFoundError:
-            print("Warning: settings.json not found. Using defaults.")
-            return {}
+            try:
+                with open("settings.json.example", "r") as f:
+                    print("Notice: settings.json not found. Loaded defaults from settings.json.example.")
+                    return json.load(f)
+            except Exception:
+                print("Warning: settings.json not found. Using defaults.")
+                return {}
         except json.JSONDecodeError:
             print("Error: Could not decode settings.json. Using defaults.")
             return {}

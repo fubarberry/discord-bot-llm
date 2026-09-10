@@ -9,6 +9,11 @@ echo "Installing dependencies for the current user"
 pip install --user -r requirements.txt
 echo "Starting bot"
 
+# Initialize settings.json from settings.json.example if missing
+if [ ! -f settings.json ] && [ -f settings.json.example ]; then
+    cp settings.json.example settings.json
+fi
+
 # Determine whether to run in the background from settings.json (fallback to RUN_IN_BACKGROUND env)
 BG_SETTING=$(python3 -c "import json; print(str(json.load(open('settings.json')).get('run_in_background', False)).lower())" 2>/dev/null || echo "false")
 
