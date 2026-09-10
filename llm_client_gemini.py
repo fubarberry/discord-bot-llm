@@ -3,7 +3,7 @@ import os
 import json
 from google import genai
 from google.genai import types
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 def _get_default_model() -> str:
@@ -23,7 +23,8 @@ async def get_llm_response(
     system_prompt: str,
     history: Optional[List[Dict[str, str]]] = None,
     grounding: bool = False,
-    model_name: Optional[str] = None
+    model_name: Optional[str] = None,
+    images: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
     Sends a prompt to the Google Gemini API and gets a response.
@@ -34,6 +35,7 @@ async def get_llm_response(
         history (List[Dict[str, str]]): The conversation history.
         grounding (bool): Kept for backwards compatibility.
         model_name (str): The Gemini model to use (e.g. 'gemini-2.5-flash').
+        images (Optional[List[Dict[str, Any]]]): Optional list of image dicts with 'data' (bytes) and 'mime_type' (str).
 
     Returns:
         Optional[str]: The text response from the model, or an error description string.
@@ -57,7 +59,8 @@ async def get_llm_response(
             role = 'user' if message.get('role') == 'user' else 'model'
             gemini_history.append({'role': role, 'parts': [{'text': message.get('content', '')}]})
 
-        print(f"Sending request to Gemini API (Model: {active_model})...")
+        image_count_str = f" with {len(images)} image(s)" if images else ""
+        print(f"Sending request to Gemini API (Model: {active_model}){image_count_str}...")
         
         if hasattr(client, 'aio'):
             chat = client.aio.chats.create(
@@ -67,7 +70,21 @@ async def get_llm_response(
                 ),
                 history=gemini_history
             )
-            response = await chat.send_message(prompt)
+            
+            # Prepare message content (text + optional image parts)
+            if images:
+                message_parts = []
+                for img in images:
+                    message_parts.append(
+                        types.Part.from_bytes(
+                            data=img["data"],
+                            mime_type=img.get("mime_type", "image/png")
+                        )
+                    )
+                message_parts.append(types.Part.from_text(text=prompt))
+                response = await chat.send_message(message_parts)
+            else:
+                response = await chat.send_message(prompt)
             
             print("Successfully received response from Gemini API.")
             if response.text:

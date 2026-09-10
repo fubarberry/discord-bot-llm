@@ -3,7 +3,8 @@ import os
 import aiohttp
 import json
 import re
-from typing import List, Dict, Optional
+import base64
+from typing import List, Dict, Optional, Any
 
 
 async def get_llm_response(
@@ -11,7 +12,8 @@ async def get_llm_response(
     system_prompt: str,
     thinking_enabled: bool = False,
     history: Optional[List[Dict[str, str]]] = None,
-    model_name: Optional[str] = None
+    model_name: Optional[str] = None,
+    images: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
     Sends a prompt to the LM Studio local server and gets a response.
@@ -22,6 +24,7 @@ async def get_llm_response(
         thinking_enabled (bool): If False, tries to suppress the model's thinking process.
         history (List[Dict[str, str]]): The conversation history.
         model_name (str): The model name for LM Studio (defaults to 'local-model').
+        images (Optional[List[Dict[str, Any]]]): Optional list of image dicts with 'data' (bytes) and 'mime_type' (str).
 
     Returns:
         Optional[str]: Text response or detailed error message.
@@ -41,7 +44,23 @@ async def get_llm_response(
         {"role": "system", "content": system_prompt}
     ]
     messages.extend(history)
-    messages.append({"role": "user", "content": prompt_to_send})
+
+    if images:
+        content_parts: List[Dict[str, Any]] = [
+            {"type": "text", "text": prompt_to_send}
+        ]
+        for img in images:
+            b64_str = base64.b64encode(img["data"]).decode("utf-8")
+            mime = img.get("mime_type", "image/png")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64_str}"
+                }
+            })
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": prompt_to_send})
     
     payload = {
         "model": model_name or "local-model",
@@ -52,7 +71,8 @@ async def get_llm_response(
     }
 
     headers = {"Content-Type": "application/json"}
-    print(f"Sending request to LM Studio at {full_api_url} (Model: {payload['model']})...")
+    image_count_str = f" with {len(images)} image(s)" if images else ""
+    print(f"Sending request to LM Studio at {full_api_url} (Model: {payload['model']}){image_count_str}...")
     if thinking_enabled:
         print("Thinking mode is ENABLED.")
     else:
@@ -78,7 +98,10 @@ async def get_llm_response(
                 else:
                     error_text = await response.text()
                     print(f"Error from LM Studio API: Status {response.status}, Response: {error_text}")
-                    return f"⚠️ **LM Studio Error (HTTP {response.status})**: {error_text}"
+                    tip = ""
+                    if images and (response.status == 400 or any(w in error_text.lower() for w in ["vision", "image", "support", "unsupported", "invalid"])):
+                        tip = "\n\n💡 *Tip: If you sent an image, ensure that the active model loaded in LM Studio is a Vision model (e.g. Qwen2-VL, Llama 3.2 Vision, MiniCPM-V). Text-only models reject image inputs.*"
+                    return f"⚠️ **LM Studio Error (HTTP {response.status})**: {error_text}{tip}"
     except aiohttp.ClientConnectorError as e:
         print(f"Error connecting to the LM Studio server: {e}")
         return f"⚠️ **LM Studio Connection Error**: Could not connect to local LM Studio server at `{full_api_url}`. Please ensure LM Studio is running with its local server started."

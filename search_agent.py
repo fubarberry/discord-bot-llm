@@ -1,6 +1,6 @@
 # search_agent.py
 import re
-from typing import List, Dict, Callable, Awaitable, Optional
+from typing import List, Dict, Callable, Awaitable, Optional, Any
 from web_search import search_duckduckgo, read_url_jina
 
 
@@ -35,9 +35,10 @@ async def run_search_augmented_generation(
     prompt: str,
     system_prompt: str,
     history: List[Dict[str, str]],
-    query_llm_fn: Callable[[str, str, Optional[List[Dict[str, str]]]], Awaitable[Optional[str]]],
+    query_llm_fn: Callable[..., Awaitable[Optional[str]]],
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-    max_search_steps: int = 3
+    max_search_steps: int = 3,
+    images: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
     Orchestrates the decision, web search, web page reading, and response generation.
@@ -53,20 +54,16 @@ async def run_search_augmented_generation(
     Returns:
         Optional[str]: Final generated response.
     """
-    await _safe_update_status(status_callback, "🔍 Checking if web search is needed...")
-
-    # Step 1: Decision - Does the prompt require web search?
-    decision_system = (
-        "You are an AI decision router. Determine if answering the user's prompt requires "
-        "real-time information, current events, recent data, or external web search.\n"
-        "- If NO web search is needed (e.g. general knowledge, greetings, coding, math, "
-        "creative writing, conversational replies), respond strictly with:\n"
-        "NO_SEARCH\n"
-        "- If web search IS needed (e.g. current events, recent news, live scores, weather, "
-        "specifications of recently released products, or explicit user request to search), respond strictly with:\n"
-        "SEARCH: <concise search query>\n"
-        "Do not provide any explanation, only NO_SEARCH or SEARCH: <query>."
-    )
+    async def _invoke_query_llm(p: str, s: str, h: Optional[List[Dict[str, str]]], imgs: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+        if imgs:
+            try:
+                return await query_llm_fn(p, s, h, imgs)
+            except TypeError:
+                try:
+                    return await query_llm_fn(p, s, h, images=imgs)
+                except TypeError:
+                    return await query_llm_fn(p, s, h)
+        return await query_llm_fn(p, s, h)
 
     # Contextualize decision with recent history if available
     recent_history_context = ""
@@ -76,7 +73,39 @@ async def run_search_augmented_generation(
         recent_history_context = f"Recent conversation context:\n{formatted_history}\n\n"
 
     decision_input = f"{recent_history_context}User prompt: {prompt}"
-    decision_result = await query_llm_fn(decision_input, decision_system, [])
+
+    if images:
+        img_desc = "image" if len(images) == 1 else f"{len(images)} images"
+        await _safe_update_status(status_callback, f"🖼️ Inspecting {img_desc} content...")
+
+        decision_system = (
+            "You are an AI assistant analyzing an image provided by the user.\n"
+            "Examine the image carefully (including any visible text, headlines, claims, people, or data).\n"
+            "Determine whether answering the user's prompt requires verifying claims or events with an external web search:\n"
+            "- If NO web search is needed (e.g. describing the image, reading its text, identifying objects/animals/scenes, "
+            "math/logic problems, general conversation, or the image itself provides all needed information), respond strictly with:\n"
+            "NO_SEARCH\n"
+            "- If web search IS needed (e.g. verifying whether a news headline, social media post, rumor, or claim shown in the image is true, "
+            "or looking up recent real-world events referenced in the image), respond strictly with:\n"
+            "SEARCH: <specific search query based on the claims/text extracted from the image>\n"
+            "Do not provide any extra explanation, only NO_SEARCH or SEARCH: <query>."
+        )
+        decision_result = await _invoke_query_llm(decision_input, decision_system, [], images)
+    else:
+        await _safe_update_status(status_callback, "🔍 Checking if web search is needed...")
+
+        decision_system = (
+            "You are an AI decision router. Determine if answering the user's prompt requires "
+            "real-time information, current events, recent data, or external web search.\n"
+            "- If NO web search is needed (e.g. general knowledge, greetings, coding, math, "
+            "creative writing, conversational replies), respond strictly with:\n"
+            "NO_SEARCH\n"
+            "- If web search IS needed (e.g. current events, recent news, live scores, weather, "
+            "specifications of recently released products, or explicit user request to search), respond strictly with:\n"
+            "SEARCH: <concise search query>\n"
+            "Do not provide any explanation, only NO_SEARCH or SEARCH: <query>."
+        )
+        decision_result = await _invoke_query_llm(decision_input, decision_system, [])
 
     if decision_result and decision_result.startswith("⚠️"):
         return decision_result
@@ -89,14 +118,14 @@ async def run_search_augmented_generation(
         else:
             initial_query = _parse_search_query(clean_decision)
             if not initial_query and "SEARCH" in clean_decision.upper():
-                # Fallback: model might have just outputted query
-                initial_query = prompt
+                # For text prompts, fallback to prompt if SEARCH keyword was outputted without format
+                initial_query = prompt if not images else None
 
     # If no search is needed, generate standard response immediately
     if not initial_query:
         print("Decision: No web search needed. Proceeding to standard generation.")
         await _safe_update_status(status_callback, "⏳ Generating response...")
-        return await query_llm_fn(prompt, system_prompt, history)
+        return await _invoke_query_llm(prompt, system_prompt, history, images)
 
     print(f"Decision: Web search needed with initial query: '{initial_query}'")
 
@@ -205,5 +234,5 @@ async def run_search_augmented_generation(
         f"=== WEB SEARCH RESEARCH ===\n{research_summary}\n=== END RESEARCH ==="
     )
 
-    final_response = await query_llm_fn(prompt, augmented_system_prompt, history)
+    final_response = await _invoke_query_llm(prompt, augmented_system_prompt, history, images)
     return final_response

@@ -3,6 +3,7 @@ This Discord bot allows you to chat with an AI, powered by either a local model 
 ## Features
 
 - **Dual Backend Support**: Choose between a local LM Studio server or the Google Gemini API.
+- **Image & Vision Processing**: Attach images or reply to messages with images and mention the bot (e.g. `@YourBotName is this real?`). Supported natively with Google Gemini API and via local vision models in LM Studio.
 - **Autonomous Web Search Grounding**: Automatically searches the web via DuckDuckGo and reads pages via Jina Reader when questions need real-time data, with live status progress messages.
 - **Slash Commands**: Modern and user-friendly `/` commands with autocomplete.
 - **Dynamic Personalities**: Use `/setprompt` to switch the bot's system prompt instantly from a predefined list or with a custom one.
@@ -143,4 +144,8 @@ Interact with the bot in your Discord server using these slash commands:
 -   `/random <True|False>`: Toggles using a random prompt for each reply.
 -   `/think <True|False>`: Toggles whether the bot shows its thought process (LM Studio only).
 -   `/grounding <True|False>`: Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader). Also available as `/websearch`.
--   **Mention the bot**: You can also have a conversation with the bot by mentioning it directly (e.g., `@YourBotName What is the capital of France?`).
+-   **Mention the bot**: You can have a conversation with the bot by mentioning it directly (e.g., `@YourBotName What is the capital of France?`).
+-   **Image Analysis & Verification**:
+    - **Reply to an image**: Reply to any message in the channel containing an image or screenshot, mention the bot, and ask your question (e.g., `@YourBotName is this true?` or `@YourBotName what is this?`).
+    - **Direct image upload**: Attach an image directly to your message and mention the bot.
+    - Works with Google Gemini (free API) and LM Studio (when a vision model such as `Qwen2-VL` or `Llama-3.2-Vision` is loaded).

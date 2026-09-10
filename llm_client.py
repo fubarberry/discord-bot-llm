@@ -1,7 +1,7 @@
 # llm_client.py
 import os
 import json
-from typing import List, Dict, Callable, Awaitable, Optional
+from typing import List, Dict, Callable, Awaitable, Optional, Any
 from llm_client_lmstudio import get_llm_response as get_lmstudio_response
 from llm_client_gemini import get_llm_response as get_gemini_response
 from search_agent import run_search_augmented_generation
@@ -37,7 +37,8 @@ async def query_llm(
     history: Optional[List[Dict[str, str]]] = None,
     thinking_enabled: bool = False,
     provider: Optional[str] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    images: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
     Sends a request to the configured LLM provider (Gemini or LM Studio).
@@ -50,13 +51,13 @@ async def query_llm(
 
     if active_provider == "GEMINI":
         print(f"Using Gemini API as the LLM provider (Model: {active_model}).")
-        return await get_gemini_response(prompt, system_prompt, history, model_name=active_model)
+        return await get_gemini_response(prompt, system_prompt, history, model_name=active_model, images=images)
     elif active_provider == "LMSTUDIO":
         print(f"Using LM Studio as the LLM provider (Model: {active_model or 'local-model'}).")
-        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model)
+        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images)
     else:
         print(f"Error: Unknown LLM_PROVIDER '{active_provider}'. Defaulting to LMSTUDIO.")
-        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model)
+        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images)
 
 
 async def get_llm_response(
@@ -67,7 +68,8 @@ async def get_llm_response(
     grounding: bool = False,
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     provider: Optional[str] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    images: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
     Gets a response from the configured LLM provider, optionally using web search grounding.
@@ -81,6 +83,7 @@ async def get_llm_response(
         status_callback: Optional async callback to send progress updates (e.g. to Discord).
         provider (str): Optional override for LLM provider ('GEMINI' or 'LMSTUDIO').
         model (str): Optional override for model name.
+        images (Optional[List[Dict[str, Any]]]): Optional images to include with the prompt.
 
     Returns:
         Optional[str]: Generated response string or error message.
@@ -89,12 +92,18 @@ async def get_llm_response(
         history = []
 
     if grounding:
-        async def _query_helper(p: str, s: str, h: Optional[List[Dict[str, str]]]) -> Optional[str]:
+        async def _query_helper(
+            p: str,
+            s: str,
+            h: Optional[List[Dict[str, str]]],
+            imgs: Optional[List[Dict[str, Any]]] = None
+        ) -> Optional[str]:
             return await query_llm(
                 p, s, h if h is not None else [],
                 thinking_enabled=thinking_enabled,
                 provider=provider,
-                model=model
+                model=model,
+                images=imgs
             )
 
         return await run_search_augmented_generation(
@@ -102,7 +111,8 @@ async def get_llm_response(
             system_prompt=system_prompt,
             history=history,
             query_llm_fn=_query_helper,
-            status_callback=status_callback
+            status_callback=status_callback,
+            images=images
         )
 
     return await query_llm(
@@ -111,5 +121,6 @@ async def get_llm_response(
         history=history,
         thinking_enabled=thinking_enabled,
         provider=provider,
-        model=model
+        model=model,
+        images=images
     )

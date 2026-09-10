@@ -4,14 +4,85 @@ from discord import app_commands
 from discord.ext import commands
 from llm_client import get_llm_response
 import json
-from typing import List
+from typing import List, Dict, Optional, Any
 import random
 import re
 import os
+import aiohttp
 
 # The maximum number of messages to keep in the history for each channel.
 # This is set via the MAX_HISTORY environment variable.
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", 20))
+
+SUPPORTED_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB limit
+MAX_IMAGES = 5
+
+
+async def _fetch_image_from_attachment(attachment: discord.Attachment) -> Optional[Dict[str, Any]]:
+    """Downloads and returns image data if attachment is a supported image."""
+    content_type = attachment.content_type or ""
+    is_image = content_type.startswith("image/") or attachment.filename.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+    if not is_image:
+        return None
+    if attachment.size > MAX_IMAGE_SIZE:
+        print(f"Skipping attachment {attachment.filename}: size {attachment.size} exceeds 20MB limit.")
+        return None
+    try:
+        data = await attachment.read()
+        mime = content_type if content_type.startswith("image/") else "image/png"
+        return {"data": data, "mime_type": mime, "filename": attachment.filename}
+    except Exception as e:
+        print(f"Error reading attachment {attachment.filename}: {e}")
+        return None
+
+
+async def _fetch_image_from_url(url: str) -> Optional[Dict[str, Any]]:
+    """Downloads image bytes from a URL (e.g. from Discord embeds)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    ct = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                    if ct.startswith("image/") or any(url.lower().endswith(ext) for ext in SUPPORTED_IMAGE_EXTENSIONS):
+                        data = await resp.read()
+                        if len(data) <= MAX_IMAGE_SIZE:
+                            mime = ct if ct.startswith("image/") else "image/png"
+                            return {"data": data, "mime_type": mime, "filename": "embed_image"}
+    except Exception as e:
+        print(f"Error fetching image from URL {url}: {e}")
+    return None
+
+
+async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, Any]]:
+    """Extracts images from message attachments and embeds."""
+    images = []
+    # 1. Attachments
+    if msg.attachments:
+        for att in msg.attachments:
+            img = await _fetch_image_from_attachment(att)
+            if img:
+                images.append(img)
+                if len(images) >= MAX_IMAGES:
+                    break
+
+    # 2. Embeds (if no attachments or space remaining)
+    if len(images) < MAX_IMAGES and msg.embeds:
+        for embed in msg.embeds:
+            url_to_fetch = None
+            if embed.image and embed.image.url:
+                url_to_fetch = embed.image.url
+            elif embed.thumbnail and embed.thumbnail.url:
+                url_to_fetch = embed.thumbnail.url
+            
+            if url_to_fetch:
+                img = await _fetch_image_from_url(url_to_fetch)
+                if img:
+                    images.append(img)
+                    if len(images) >= MAX_IMAGES:
+                        break
+
+    return images
 
 class LLMBot(commands.Bot):
     """
@@ -137,33 +208,65 @@ class LLMBot(commands.Bot):
         if self.user.mentioned_in(message):
             status_msg = None
             try:
+                # Send early status reply so the user gets instant visual feedback
+                has_possible_images = bool(message.attachments) or bool(message.reference)
+                if has_possible_images:
+                    status_msg = await message.reply("🖼️ **Processing image(s)...** Please wait, image analysis can take a moment.", mention_author=False)
+                else:
+                    status_msg = await message.reply("⏳ Generating response...", mention_author=False)
+
                 prompt = message.content.replace(f'<@!{self.user.id}>', '').replace(f'<@{self.user.id}>', '').strip()
-                
+                images: List[Dict[str, Any]] = []
+
                 # Check if the message is a reply
                 if message.reference and message.reference.message_id:
                     try:
                         referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                        
+                        # Extract images from the referenced message
+                        ref_images = await _extract_images_from_message(referenced_message)
+                        if ref_images:
+                            images.extend(ref_images)
+                            print(f"Extracted {len(ref_images)} image(s) from referenced message by {referenced_message.author.name}")
+
                         if referenced_message.content:
                             context_str = f"[Context: Replying to a message by {referenced_message.author.name}: \"{referenced_message.content}\"]\n\n"
                             prompt = context_str + prompt
                             print(f"Added reply context from {referenced_message.author.name}")
+                        elif ref_images:
+                            context_str = f"[Context: Replying to an image posted by {referenced_message.author.name}]\n\n"
+                            prompt = context_str + prompt
                     except discord.NotFound:
                         print("Referenced message not found (it might have been deleted).")
                     except Exception as e:
                         print(f"Error fetching referenced message: {e}")
 
-                if not prompt:
-                    await message.reply("You mentioned me, but didn't ask anything! How can I help?", mention_author=False)
+                # Extract images from current message
+                current_images = await _extract_images_from_message(message)
+                if current_images:
+                    for img in current_images:
+                        if len(images) < MAX_IMAGES:
+                            images.append(img)
+                    print(f"Extracted {len(current_images)} image(s) from current message by {message.author.name}")
+
+                if not prompt and not images:
+                    await status_msg.edit(content="You mentioned me, but didn't ask anything or provide an image! How can I help?")
                     return
-                
+                elif not prompt and images:
+                    prompt = "Describe this image in detail and tell me what you observe."
+
                 # Check user's prompt for banned words
                 if self.contains_banned_word(prompt):
-                    await message.reply("I'm sorry, but your message contains inappropriate language and cannot be processed.", mention_author=False)
+                    await status_msg.edit(content="I'm sorry, but your message contains inappropriate language and cannot be processed.")
                     print(f"Rejected prompt from {message.author.name} due to banned word.")
                     return
 
-                # Send immediate status reply
-                status_msg = await message.reply("⏳ Generating response...", mention_author=False)
+                # Update status with image count details if images were detected
+                if images:
+                    img_text = "image" if len(images) == 1 else f"{len(images)} images"
+                    await status_msg.edit(content=f"🖼️ **Analyzing {img_text}...** Please hold on, vision models may take a bit longer to process.")
+                elif has_possible_images:
+                    await status_msg.edit(content="⏳ Generating response...")
 
                 async def update_status(text: str):
                     if status_msg:
@@ -172,7 +275,9 @@ class LLMBot(commands.Bot):
                         except Exception as e:
                             print(f"Error editing status message: {e}")
 
-                print(f"Received prompt from {message.author.name}: '{prompt}'")
+                prompt_log = prompt if len(prompt) <= 100 else f"{prompt[:100]}..."
+                image_log = f" [with {len(images)} image(s)]" if images else ""
+                print(f"Received prompt from {message.author.name}: '{prompt_log}'{image_log}")
 
                 channel_id = message.channel.id
                 if channel_id not in self.message_history:
@@ -199,7 +304,8 @@ class LLMBot(commands.Bot):
                     grounding=self.grounding_enabled,
                     status_callback=update_status,
                     provider=self.llm_provider,
-                    model=self.gemini_model if self.llm_provider == "GEMINI" else None
+                    model=self.gemini_model if self.llm_provider == "GEMINI" else None,
+                    images=images if images else None
                 )
 
                 if llm_response:
@@ -216,7 +322,11 @@ class LLMBot(commands.Bot):
                         return
                     
                     # Add the user's prompt and the AI's response to the history
-                    history.append({"role": "user", "content": prompt})
+                    history_prompt = prompt
+                    if images:
+                        history_prompt = f"{prompt}\n[Attached {len(images)} image(s)]"
+
+                    history.append({"role": "user", "content": history_prompt})
                     history.append({"role": "assistant", "content": llm_response})
                     
                     # Keep the history to a manageable size
