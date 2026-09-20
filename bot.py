@@ -1,4 +1,5 @@
 # bot.py
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -37,26 +38,44 @@ async def _fetch_image_from_attachment(attachment: discord.Attachment) -> Option
         return None
 
 
+DISCORD_BOT_USER_AGENT = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+
 async def _fetch_image_from_url(url: str) -> Optional[Dict[str, Any]]:
-    """Downloads image bytes from a URL (e.g. from Discord embeds)."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                    if ct.startswith("image/") or any(url.lower().endswith(ext) for ext in SUPPORTED_IMAGE_EXTENSIONS):
-                        data = await resp.read()
-                        if len(data) <= MAX_IMAGE_SIZE:
-                            mime = ct if ct.startswith("image/") else "image/png"
-                            return {"data": data, "mime_type": mime, "filename": "embed_image"}
-    except Exception as e:
-        print(f"Error fetching image from URL {url}: {e}")
+    """Downloads image bytes from a URL (e.g. from Discord embeds, CDN links, or media services)."""
+    user_agents = [DISCORD_BOT_USER_AGENT, BROWSER_USER_AGENT]
+    clean_url_path = url.split("?")[0].split("#")[0].lower()
+
+    for ua in user_agents:
+        headers = {
+            "User-Agent": ua,
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                        is_image_type = ct.startswith("image/") or any(
+                            clean_url_path.endswith(ext) for ext in SUPPORTED_IMAGE_EXTENSIONS
+                        )
+                        if is_image_type:
+                            data = await resp.read()
+                            if 0 < len(data) <= MAX_IMAGE_SIZE:
+                                mime = ct if ct.startswith("image/") else "image/png"
+                                return {"data": data, "mime_type": mime, "filename": "embed_image", "source_url": url}
+        except Exception as e:
+            print(f"Error fetching image from URL {url} with UA ({ua[:30]}...): {e}")
+
     return None
 
 
 async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, Any]]:
-    """Extracts images from message attachments and embeds."""
+    """Extracts images from message attachments, embeds, and direct media URLs."""
     images = []
+    seen_urls = set()
+
     # 1. Attachments
     if msg.attachments:
         for att in msg.attachments:
@@ -64,23 +83,53 @@ async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, A
             if img:
                 images.append(img)
                 if len(images) >= MAX_IMAGES:
-                    break
+                    return images
 
-    # 2. Embeds (if no attachments or space remaining)
+    # 2. Embeds (try Discord proxy_url first, then direct url)
     if len(images) < MAX_IMAGES and msg.embeds:
         for embed in msg.embeds:
-            url_to_fetch = None
-            if embed.image and embed.image.url:
-                url_to_fetch = embed.image.url
-            elif embed.thumbnail and embed.thumbnail.url:
-                url_to_fetch = embed.thumbnail.url
-            
-            if url_to_fetch:
-                img = await _fetch_image_from_url(url_to_fetch)
+            urls_to_try = []
+            if embed.image:
+                if embed.image.proxy_url:
+                    urls_to_try.append(embed.image.proxy_url)
+                if embed.image.url and embed.image.url != embed.image.proxy_url:
+                    urls_to_try.append(embed.image.url)
+            if embed.thumbnail:
+                if embed.thumbnail.proxy_url:
+                    urls_to_try.append(embed.thumbnail.proxy_url)
+                if embed.thumbnail.url and embed.thumbnail.url != embed.thumbnail.proxy_url:
+                    urls_to_try.append(embed.thumbnail.url)
+            if embed.video:
+                if embed.video.proxy_url:
+                    urls_to_try.append(embed.video.proxy_url)
+                if embed.video.url and embed.video.url != embed.video.proxy_url:
+                    urls_to_try.append(embed.video.url)
+
+            for u in urls_to_try:
+                if not u or u in seen_urls:
+                    continue
+                seen_urls.add(u)
+                img = await _fetch_image_from_url(u)
                 if img:
                     images.append(img)
                     if len(images) >= MAX_IMAGES:
-                        break
+                        return images
+                    break
+
+    # 3. Direct URLs in message text (e.g. image URLs or media embed links)
+    if len(images) < MAX_IMAGES and msg.content and isinstance(msg.content, str):
+        url_matches = re.findall(r'https?://[^\s<>"\'`]+', msg.content)
+        for raw_u in url_matches:
+            clean_u = re.sub(r'[.,;:!?)]+$', '', raw_u)
+            if not clean_u or clean_u in seen_urls:
+                continue
+            seen_urls.add(clean_u)
+            img = await _fetch_image_from_url(clean_u)
+            if img:
+                img["source_url"] = clean_u
+                images.append(img)
+                if len(images) >= MAX_IMAGES:
+                    return images
 
     return images
 
@@ -208,8 +257,9 @@ class LLMBot(commands.Bot):
         if self.user.mentioned_in(message):
             status_msg = None
             try:
+                has_urls = bool(re.search(r'https?://', message.content))
                 # Send early status reply so the user gets instant visual feedback
-                has_possible_images = bool(message.attachments) or bool(message.reference)
+                has_possible_images = bool(message.attachments) or bool(message.reference) or has_urls
                 if has_possible_images:
                     status_msg = await message.reply("🖼️ **Processing image(s)...** Please wait, image analysis can take a moment.", mention_author=False)
                 else:
@@ -229,8 +279,18 @@ class LLMBot(commands.Bot):
                             images.extend(ref_images)
                             print(f"Extracted {len(ref_images)} image(s) from referenced message by {referenced_message.author.name}")
 
-                        if referenced_message.content:
-                            context_str = f"[Context: Replying to a message by {referenced_message.author.name}: \"{referenced_message.content}\"]\n\n"
+                        # Check if referenced message was solely an image or media link
+                        ref_urls = [img.get("source_url") for img in ref_images if img.get("source_url")]
+                        clean_ref_content = referenced_message.content.strip() if referenced_message.content else ""
+                        is_only_media_link = clean_ref_content in ref_urls or (
+                            ref_images and clean_ref_content and all(
+                                re.sub(r'[.,;:!?)]+$', '', u) in ref_urls
+                                for u in re.findall(r'https?://[^\s<>"\'`]+', clean_ref_content)
+                            )
+                        )
+
+                        if clean_ref_content and not is_only_media_link:
+                            context_str = f"[Context: Replying to a message by {referenced_message.author.name}: \"{clean_ref_content}\"]\n\n"
                             prompt = context_str + prompt
                             print(f"Added reply context from {referenced_message.author.name}")
                         elif ref_images:
@@ -241,6 +301,14 @@ class LLMBot(commands.Bot):
                     except Exception as e:
                         print(f"Error fetching referenced message: {e}")
 
+                # If current message has URLs but no attachments or embeds yet, wait briefly for Discord to unfurl embeds
+                if not message.attachments and not message.embeds and has_urls:
+                    await asyncio.sleep(0.8)
+                    try:
+                        message = await message.channel.fetch_message(message.id)
+                    except Exception as e:
+                        print(f"Could not re-fetch message for embeds: {e}")
+
                 # Extract images from current message
                 current_images = await _extract_images_from_message(message)
                 if current_images:
@@ -248,6 +316,16 @@ class LLMBot(commands.Bot):
                         if len(images) < MAX_IMAGES:
                             images.append(img)
                     print(f"Extracted {len(current_images)} image(s) from current message by {message.author.name}")
+
+                    # If prompt was solely the media URL(s) that were extracted as images, clear it
+                    extracted_urls = {
+                        re.sub(r'[.,;:!?)]+$', '', img.get("source_url", ""))
+                        for img in current_images if img.get("source_url")
+                    }
+                    words = prompt.split()
+                    remaining_words = [w for w in words if re.sub(r'[.,;:!?)]+$', '', w) not in extracted_urls]
+                    if not remaining_words:
+                        prompt = ""
 
                 if not prompt and not images:
                     await status_msg.edit(content="You mentioned me, but didn't ask anything or provide an image! How can I help?")

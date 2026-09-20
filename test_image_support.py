@@ -242,6 +242,119 @@ class TestImageSupport(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("liquid water", response)
 
+    async def test_fetch_image_from_url_with_discord_ua(self):
+        """Verify _fetch_image_from_url uses Discordbot UA and parses image content."""
+        from bot import _fetch_image_from_url, DISCORD_BOT_USER_AGENT
+
+        class MockResponse:
+            status = 200
+            headers = {"Content-Type": "image/jpeg"}
+            async def read(self):
+                return TINY_PNG
+
+        captured_headers = None
+        class MockSession:
+            def __init__(self, headers=None):
+                nonlocal captured_headers
+                captured_headers = headers
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def get(self, url, timeout=None, allow_redirects=True):
+                mock_ctx = AsyncMock()
+                mock_ctx.__aenter__.return_value = MockResponse()
+                return mock_ctx
+
+        with patch("aiohttp.ClientSession", side_effect=MockSession):
+            result = await _fetch_image_from_url("https://www.kkinstagram.com/reel/12345/?stkn=abc")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["mime_type"], "image/jpeg")
+            self.assertEqual(result["data"], TINY_PNG)
+            self.assertEqual(captured_headers.get("User-Agent"), DISCORD_BOT_USER_AGENT)
+
+    async def test_extract_images_from_embed_proxy(self):
+        """Verify _extract_images_from_message prioritizes proxy_url for embeds."""
+        from bot import _extract_images_from_message
+        import discord
+
+        embed = discord.Embed.from_dict({
+            "title": "Embed with image",
+            "image": {
+                "url": "https://origin.example.com/image.jpg",
+                "proxy_url": "https://images-ext-1.discordapp.net/external/image.jpg"
+            }
+        })
+        mock_msg = MagicMock()
+        mock_msg.attachments = []
+        mock_msg.embeds = [embed]
+        mock_msg.content = ""
+
+        with patch("bot._fetch_image_from_url", new=AsyncMock(return_value={"data": TINY_PNG, "mime_type": "image/jpeg", "filename": "embed_image"})) as mock_fetch:
+            imgs = await _extract_images_from_message(mock_msg)
+            self.assertEqual(len(imgs), 1)
+            mock_fetch.assert_called_once_with("https://images-ext-1.discordapp.net/external/image.jpg")
+
+    async def test_extract_images_from_content_urls(self):
+        """Verify _extract_images_from_message detects image URLs directly in message content."""
+        from bot import _extract_images_from_message
+
+        mock_msg = MagicMock()
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.content = "Look at this https://www.kkinstagram.com/reel/12345/?stkn=abc and also https://en.wikipedia.org/wiki/Test"
+
+        async def fake_fetch(url):
+            if "kkinstagram" in url:
+                return {"data": TINY_PNG, "mime_type": "image/jpeg", "filename": "embed_image", "source_url": url}
+            return None
+
+        with patch("bot._fetch_image_from_url", side_effect=fake_fetch):
+            imgs = await _extract_images_from_message(mock_msg)
+            self.assertEqual(len(imgs), 1)
+            self.assertEqual(imgs[0]["mime_type"], "image/jpeg")
+
+    async def test_on_message_media_url_prompt_cleanup(self):
+        """Verify on_message clears prompt when the user sends only a media link."""
+        from bot import LLMBot
+        from unittest.mock import PropertyMock
+
+        bot = LLMBot()
+        mock_user = MagicMock()
+        mock_user.id = 12345
+        mock_user.name = "TestBot"
+
+        status_msg = AsyncMock()
+        status_msg.edit = AsyncMock()
+
+        test_url = "https://www.kkinstagram.com/reel/12345/?stkn=abc"
+        mock_msg = MagicMock()
+        mock_msg.id = 777
+        mock_msg.author = MagicMock()
+        mock_msg.author.name = "TestUser"
+        mock_msg.content = f"<@12345> {test_url}"
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.reference = None
+        mock_msg.channel = MagicMock()
+        mock_msg.channel.id = 999
+        mock_msg.channel.fetch_message = AsyncMock(return_value=mock_msg)
+        mock_msg.reply = AsyncMock(return_value=status_msg)
+
+        img_data = {"data": TINY_PNG, "mime_type": "image/jpeg", "filename": "embed_image", "source_url": test_url}
+
+        with patch.object(LLMBot, 'user', new_callable=PropertyMock, return_value=mock_user):
+            with patch("bot._extract_images_from_message", new=AsyncMock(return_value=[img_data])):
+                with patch("bot.get_llm_response", new=AsyncMock(return_value="Detailed visual description.")) as mock_llm:
+                    await bot.on_message(mock_msg)
+
+        mock_llm.assert_called_once()
+        call_prompt = mock_llm.call_args[0][0]
+        # Should have converted bare media URL into the default vision prompt
+        self.assertIn("Describe this image in detail", call_prompt)
+        self.assertNotIn(test_url, call_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
+
