@@ -5,9 +5,18 @@ if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 fi
 
-if [ ! -d "venv" ]; then
+if [ ! -f "venv/bin/activate" ]; then
     echo "Creating virtual environment in 'venv'..."
+    rm -rf venv
     python3 -m venv venv
+    if [ ! -f "venv/bin/activate" ]; then
+        echo ""
+        echo "❌ Error: Failed to create virtual environment."
+        echo "On Ubuntu/Debian, install the venv package first:"
+        echo "    sudo apt update && sudo apt install -y python3-venv python3.12-venv"
+        echo ""
+        exit 1
+    fi
 fi
 
 echo "Activating virtual environment..."
