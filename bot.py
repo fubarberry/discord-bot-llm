@@ -154,6 +154,7 @@ class LLMBot(commands.Bot):
         # Load persistent settings
         self.settings = self.load_settings()
         self.system_prompt = self.settings.get("system_prompt", self.prompts.get("default", "You are a helpful assistant."))
+        self.prompt_name = self.settings.get("prompt_name") or self.get_prompt_name(self.system_prompt)
         self.random_mode = self.settings.get("random_mode", False)
         self.thinking_enabled = self.settings.get("thinking_enabled", False)
         self.grounding_enabled = self.settings.get("grounding_enabled", False)
@@ -161,10 +162,22 @@ class LLMBot(commands.Bot):
         self.gemini_model = self.settings.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
         self.run_in_background = self.settings.get("run_in_background", os.getenv("RUN_IN_BACKGROUND", "false").lower() == "true")
         self.max_history = int(self.settings.get("max_history", os.getenv("MAX_HISTORY", 15)))
+        self.temperature = float(self.settings.get("temperature", 0.7))
         self.last_random_prompt = None # This doesn't need to be persisted
+        self.last_random_prompt_name = None
+        self.last_response_info = None # Information about the last response generated
         
         self.message_history = {}
-        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}). Connecting to Discord...")
+        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Temp: {self.temperature}, Prompt: {self.prompt_name}). Connecting to Discord...")
+
+    def get_prompt_name(self, prompt_text: str) -> str:
+        """Returns the preset name matching prompt_text, or 'custom' if none match."""
+        if not prompt_text:
+            return "default"
+        for name, text in self.prompts.items():
+            if text.strip() == prompt_text.strip():
+                return name
+        return "custom"
 
     def load_prompts(self) -> dict:
         """Loads system prompts from the prompts.json file."""
@@ -213,13 +226,15 @@ class LLMBot(commands.Bot):
         """Saves current settings to settings.json."""
         settings = {
             "system_prompt": self.system_prompt,
+            "prompt_name": self.prompt_name,
             "random_mode": self.random_mode,
             "thinking_enabled": self.thinking_enabled,
             "grounding_enabled": self.grounding_enabled,
             "llm_provider": self.llm_provider,
             "gemini_model": self.gemini_model,
             "run_in_background": self.run_in_background,
-            "max_history": self.max_history
+            "max_history": self.max_history,
+            "temperature": self.temperature
         }
         try:
             with open("settings.json", "w") as f:
@@ -364,16 +379,20 @@ class LLMBot(commands.Bot):
                 history = self.message_history[channel_id]
                 
                 current_system_prompt = self.system_prompt
+                current_prompt_name = self.prompt_name
                 if self.random_mode:
-                    available_prompts = list(self.prompts.values())
+                    available_prompts = list(self.prompts.items())
                     if available_prompts:
-                        chosen_prompt = random.choice(available_prompts)
+                        chosen_name, chosen_prompt = random.choice(available_prompts)
                         self.last_random_prompt = chosen_prompt
+                        self.last_random_prompt_name = chosen_name
                         current_system_prompt = chosen_prompt
-                        print(f"Random mode ON. Using prompt: {chosen_prompt[:60]}...")
+                        current_prompt_name = chosen_name
+                        print(f"Random mode ON. Using prompt '{chosen_name}': {chosen_prompt[:60]}...")
                     else:
                         print("Random mode ON, but no prompts are available. Using default.")
 
+                resp_metadata = {}
                 llm_response = await get_llm_response(
                     prompt,
                     current_system_prompt,
@@ -383,10 +402,25 @@ class LLMBot(commands.Bot):
                     status_callback=update_status,
                     provider=self.llm_provider,
                     model=self.gemini_model if self.llm_provider == "GEMINI" else None,
-                    images=images if images else None
+                    images=images if images else None,
+                    metadata=resp_metadata,
+                    temperature=self.temperature
                 )
 
                 if llm_response:
+                    # Record details for /info command regarding this last response generated
+                    self.last_response_info = {
+                        "provider": resp_metadata.get("provider", self.llm_provider),
+                        "model": resp_metadata.get("model", self.gemini_model if self.llm_provider == "GEMINI" else "local-model"),
+                        "temperature": resp_metadata.get("temperature", self.temperature),
+                        "grounding_enabled": self.grounding_enabled,
+                        "grounding_used": resp_metadata.get("grounding_used", False),
+                        "system_prompt": current_system_prompt,
+                        "prompt_name": current_prompt_name,
+                        "random_mode": self.random_mode,
+                        "image_processing_used": bool(images and len(images) > 0)
+                    }
+
                     # If this is an error reported from the LLM provider, show it directly without saving to history
                     if llm_response.startswith("⚠️"):
                         print(f"Reporting LLM error to user: {llm_response}")
@@ -411,13 +445,19 @@ class LLMBot(commands.Bot):
                     if len(history) > self.max_history * 2: # Each interaction is 2 messages
                         self.message_history[channel_id] = history[-(self.max_history * 2):]
 
-                    if len(llm_response) > 2000:
-                        parts = [llm_response[i:i+2000] for i in range(0, len(llm_response), 2000)]
+                    # Append notice if system prompt was altered from default or random mode is on
+                    discord_response = llm_response
+                    if (current_prompt_name and current_prompt_name.lower() != "default") or self.random_mode:
+                        random_suffix = " (random)" if self.random_mode else ""
+                        discord_response = f"{discord_response.rstrip()}\n-# System prompt: {current_prompt_name}{random_suffix}"
+
+                    if len(discord_response) > 2000:
+                        parts = [discord_response[i:i+2000] for i in range(0, len(discord_response), 2000)]
                         await status_msg.edit(content=parts[0])
                         for part in parts[1:]:
                             await message.channel.send(part)
                     else:
-                        await status_msg.edit(content=llm_response)
+                        await status_msg.edit(content=discord_response)
                 else:
                     await status_msg.edit(content="⚠️ No response was received from the model.")
             
@@ -446,9 +486,11 @@ async def setprompt(interaction: discord.Interaction, name: str):
 
     if name in bot.prompts:
         bot.system_prompt = bot.prompts[name]
+        bot.prompt_name = name
         response_parts.append(f"System prompt changed to **{name}**.")
     else:
         bot.system_prompt = name
+        bot.prompt_name = "custom"
         response_parts.append(f"Custom system prompt has been set.")
     
     bot.save_settings()
@@ -465,18 +507,63 @@ async def setprompt_autocomplete(interaction: discord.Interaction, current: str)
     ]
     return choices[:25]
 
-@app_commands.command(name="prompt", description="Shows the current system prompt or random mode status.")
-async def prompt(interaction: discord.Interaction):
+@app_commands.command(name="info", description="Shows details about the last generated response and bot configuration.")
+async def info_command(interaction: discord.Interaction):
     bot = interaction.client
-    if bot.random_mode:
-        response_message = "🎲 **Random prompt mode is ON.**"
-        if bot.last_random_prompt:
-            response_message += f"\n\n**Last Used Prompt:**\n```\n{bot.last_random_prompt}\n```"
-        else:
-            response_message += "\n\nA random prompt will be picked for the next message you send me."
-        await interaction.response.send_message(response_message, ephemeral=True)
+    info = bot.last_response_info
+
+    embed = discord.Embed(
+        title="ℹ️ Response & Bot Information",
+        color=discord.Color.blue()
+    )
+
+    if info:
+        provider_val = info.get("provider", "UNKNOWN")
+        provider_name = "Google Gemini" if provider_val == "GEMINI" else "LM Studio"
+        model_val = info.get("model", "N/A")
+        temp_val = info.get("temperature", bot.temperature)
+        grounding_on = "Enabled" if info.get("grounding_enabled") else "Disabled"
+        grounding_used = "Yes" if info.get("grounding_used") else "No"
+        random_on = "Enabled" if info.get("random_mode") else "Disabled"
+        image_used = "Yes" if info.get("image_processing_used") else "No"
+        sys_prompt = info.get("system_prompt", "N/A")
+        prompt_name = info.get("prompt_name") or bot.get_prompt_name(sys_prompt)
+
+        embed.description = "Information for the **last response generated**:"
+        embed.add_field(name="🤖 LLM Provider", value=f"**{provider_name}** (`{provider_val}`)", inline=True)
+        embed.add_field(name="🧠 Model", value=f"`{model_val}`", inline=True)
+        embed.add_field(name="🌡️ Temperature", value=f"`{temp_val}`", inline=True)
+        embed.add_field(name="🎲 Random Mode", value=f"**{random_on}**", inline=True)
+        embed.add_field(name="🌍 Grounding Setting", value=f"**{grounding_on}**", inline=True)
+        embed.add_field(name="🔍 Grounding Used", value=f"**{grounding_used}**", inline=True)
+        embed.add_field(name="🖼️ Image Processing Used", value=f"**{image_used}**", inline=True)
+
+        prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
+        embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
     else:
-        await interaction.response.send_message(f"**Current System Prompt:**\n```\n{bot.system_prompt}\n```", ephemeral=True)
+        # Fallback if no response has been generated yet since the bot started
+        provider_val = bot.llm_provider
+        provider_name = "Google Gemini" if provider_val == "GEMINI" else "LM Studio"
+        model_val = bot.gemini_model if provider_val == "GEMINI" else "local-model"
+        temp_val = bot.temperature
+        grounding_on = "Enabled" if bot.grounding_enabled else "Disabled"
+        random_on = "Enabled" if bot.random_mode else "Disabled"
+        sys_prompt = bot.system_prompt
+        prompt_name = bot.prompt_name or bot.get_prompt_name(sys_prompt)
+
+        embed.description = "*(No responses have been generated yet since the bot started. Showing current configuration)*"
+        embed.add_field(name="🤖 LLM Provider", value=f"**{provider_name}** (`{provider_val}`)", inline=True)
+        embed.add_field(name="🧠 Model", value=f"`{model_val}`", inline=True)
+        embed.add_field(name="🌡️ Temperature", value=f"`{temp_val}`", inline=True)
+        embed.add_field(name="🎲 Random Mode", value=f"**{random_on}**", inline=True)
+        embed.add_field(name="🌍 Grounding Setting", value=f"**{grounding_on}**", inline=True)
+        embed.add_field(name="🔍 Grounding Used", value="*N/A (No responses yet)*", inline=True)
+        embed.add_field(name="🖼️ Image Processing Used", value="*N/A (No responses yet)*", inline=True)
+
+        prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
+        embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @app_commands.command(name="random", description="Toggle random system prompts for each reply.")
 @app_commands.describe(enabled="Set to 'True' to enable, 'False' to disable.")
@@ -586,7 +673,7 @@ async def model_command_autocomplete(interaction: discord.Interaction, current: 
         choices.insert(0, app_commands.Choice(name=f"Custom: {current}", value=current))
     return choices[:25]
 
-@app_commands.command(name="showprompts", description="Lists all available preset prompts.")
+@app_commands.command(name="listprompts", description="Lists all available preset prompts.")
 async def list_prompts(interaction: discord.Interaction):
     bot = interaction.client
     if not bot.prompts:
@@ -597,17 +684,35 @@ async def list_prompts(interaction: discord.Interaction):
         embed.add_field(name=name, value=f"```{content[:100]}...```", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@app_commands.command(name="temp", description="Set the model temperature between 0.0 and 2.0 (Admin only).")
+@app_commands.describe(value="Temperature value between 0.0 and 2.0. Default is 0.7.")
+@app_commands.default_permissions(administrator=True)
+async def temp_command(interaction: discord.Interaction, value: float):
+    if interaction.guild and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You do not have permission to use this command (Administrator required).", ephemeral=True)
+        return
+
+    if value < 0.0 or value > 2.0:
+        await interaction.response.send_message("❌ Temperature must be between 0.0 and 2.0.", ephemeral=True)
+        return
+
+    bot = interaction.client
+    bot.temperature = round(value, 2)
+    bot.save_settings()
+    await interaction.response.send_message(f"✅ Temperature updated to **{bot.temperature}**.", ephemeral=True)
+
 @app_commands.command(name="help", description="Shows the list of available commands.")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="Bot Commands", description="Here are the available slash commands:", color=discord.Color.green())
     embed.add_field(name="/provider [LM Studio|Gemini]", value="Switches the active LLM provider (Admin only). Alias: `/source`.", inline=False)
     embed.add_field(name="/model [name]", value="Changes the active model name (Admin only).", inline=False)
+    embed.add_field(name="/temp [0.0 - 2.0]", value="Sets the model temperature between 0.0 and 2.0 (Admin only). Default is 0.7.", inline=False)
     embed.add_field(name="/setprompt [name|custom]", value="Sets the bot's system prompt. This disables random mode.", inline=False)
-    embed.add_field(name="/prompt", value="Displays the current system prompt or random mode status.", inline=False)
+    embed.add_field(name="/info", value="Displays details about the last response generated and active configuration.", inline=False)
     embed.add_field(name="/random [True|False]", value="Toggles using a random prompt for each reply.", inline=False)
     embed.add_field(name="/think [True|False]", value="Toggles whether the bot shows its thought process (LM Studio only).", inline=False)
     embed.add_field(name="/grounding [True|False]", value="Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader).", inline=False)
-    embed.add_field(name="/showprompts", value="Lists all available preset prompts.", inline=False)
+    embed.add_field(name="/listprompts", value="Lists all available preset prompts.", inline=False)
     embed.add_field(name="/clearhistory", value="Clears the conversation history for this channel.", inline=False)
     embed.add_field(name="/help", value="Shows this help message.", inline=False)
     embed.add_field(name="Mention the bot (@BotName)", value="Ask the bot a question directly by mentioning it.", inline=False)
@@ -628,8 +733,9 @@ async def setup(bot: commands.Bot):
     bot.tree.add_command(provider_command)
     bot.tree.add_command(source_command)
     bot.tree.add_command(model_command)
+    bot.tree.add_command(temp_command)
     bot.tree.add_command(setprompt)
-    bot.tree.add_command(prompt)
+    bot.tree.add_command(info_command)
     bot.tree.add_command(list_prompts)
     bot.tree.add_command(help_command)
     bot.tree.add_command(random_command)

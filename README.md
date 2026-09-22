@@ -136,8 +136,9 @@ To stop the bot, simply run the `stop.sh` script:
 Interact with the bot in your Discord server using these slash commands:
 
 -   `/help`: Shows a list of all available commands.
--   `/showprompts`: Lists all the available preset personalities (system prompts) from the `prompts.json` file.
--   `/prompt`: Shows the system prompt the bot is currently using.
+-   `/listprompts`: Lists all the available preset personalities (system prompts) from the `prompts.json` file.
+-   `/info`: Shows details about the last response generated (LLM provider, model, temperature, grounding status, whether grounding was used, system prompt, random mode, and image processing).
+-   `/temp <0.0 - 2.0>`: Sets the model temperature (Admin only). Default is `0.7`.
 -   `/setprompt <name>`: Changes the bot's personality. Start typing a name, and it will autocomplete with available presets. You can also type your own custom prompt directly.
 -   `/provider <LM Studio|Gemini>`: Switches the active LLM provider (Admin only). Also available as `/source`.
 -   `/model <name>`: Changes the active model name (Admin only, with preset autocomplete for Gemini models).

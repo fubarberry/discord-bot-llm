@@ -13,7 +13,8 @@ async def get_llm_response(
     thinking_enabled: bool = False,
     history: Optional[List[Dict[str, str]]] = None,
     model_name: Optional[str] = None,
-    images: Optional[List[Dict[str, Any]]] = None
+    images: Optional[List[Dict[str, Any]]] = None,
+    temperature: Optional[float] = None
 ) -> Optional[str]:
     """
     Sends a prompt to the LM Studio local server and gets a response.
@@ -25,6 +26,7 @@ async def get_llm_response(
         history (List[Dict[str, str]]): The conversation history.
         model_name (str): The model name for LM Studio (defaults to 'local-model').
         images (Optional[List[Dict[str, Any]]]): Optional list of image dicts with 'data' (bytes) and 'mime_type' (str).
+        temperature (Optional[float]): Model temperature (defaults to 0.7).
 
     Returns:
         Optional[str]: Text response or detailed error message.
@@ -65,7 +67,7 @@ async def get_llm_response(
     payload = {
         "model": model_name or "local-model",
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": 0.7 if temperature is None else temperature,
         "max_tokens": -1,
         "stream": False
     }

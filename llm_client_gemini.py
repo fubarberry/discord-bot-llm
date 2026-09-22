@@ -24,7 +24,8 @@ async def get_llm_response(
     history: Optional[List[Dict[str, str]]] = None,
     grounding: bool = False,
     model_name: Optional[str] = None,
-    images: Optional[List[Dict[str, Any]]] = None
+    images: Optional[List[Dict[str, Any]]] = None,
+    temperature: Optional[float] = None
 ) -> Optional[str]:
     """
     Sends a prompt to the Google Gemini API and gets a response.
@@ -36,6 +37,7 @@ async def get_llm_response(
         grounding (bool): Kept for backwards compatibility.
         model_name (str): The Gemini model to use (e.g. 'gemini-2.5-flash').
         images (Optional[List[Dict[str, Any]]]): Optional list of image dicts with 'data' (bytes) and 'mime_type' (str).
+        temperature (Optional[float]): Model temperature (defaults to 0.7).
 
     Returns:
         Optional[str]: The text response from the model, or an error description string.
@@ -63,10 +65,12 @@ async def get_llm_response(
         print(f"Sending request to Gemini API (Model: {active_model}){image_count_str}...")
         
         if hasattr(client, 'aio'):
+            temp = 0.7 if temperature is None else temperature
             chat = client.aio.chats.create(
                 model=active_model,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt
+                    system_instruction=system_prompt,
+                    temperature=temp
                 ),
                 history=gemini_history
             )

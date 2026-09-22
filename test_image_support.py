@@ -95,6 +95,9 @@ class TestImageSupport(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import PropertyMock
 
         bot = LLMBot()
+        bot.random_mode = False
+        bot.prompt_name = "default"
+        bot.system_prompt = bot.prompts["default"]
         mock_user = MagicMock()
         mock_user.id = 12345
         mock_user.name = "TestBot"

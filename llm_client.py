@@ -31,6 +31,18 @@ def _get_default_model(provider: str) -> Optional[str]:
     return os.getenv("GEMINI_MODEL", "gemini-2.0-flash") if provider == "GEMINI" else None
 
 
+def _get_default_temperature() -> float:
+    """Reads default temperature from settings.json or falls back to 0.7."""
+    try:
+        with open("settings.json", "r") as f:
+            data = json.load(f)
+            if "temperature" in data and data["temperature"] is not None:
+                return float(data["temperature"])
+    except Exception:
+        pass
+    return 0.7
+
+
 async def query_llm(
     prompt: str,
     system_prompt: str,
@@ -38,7 +50,9 @@ async def query_llm(
     thinking_enabled: bool = False,
     provider: Optional[str] = None,
     model: Optional[str] = None,
-    images: Optional[List[Dict[str, Any]]] = None
+    images: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None
 ) -> Optional[str]:
     """
     Sends a request to the configured LLM provider (Gemini or LM Studio).
@@ -48,16 +62,22 @@ async def query_llm(
 
     active_provider = (provider or _get_default_provider()).upper()
     active_model = model or _get_default_model(active_provider)
+    active_temperature = temperature if temperature is not None else _get_default_temperature()
+
+    if metadata is not None:
+        metadata["provider"] = active_provider
+        metadata["model"] = active_model or ("gemini-2.0-flash" if active_provider == "GEMINI" else "local-model")
+        metadata["temperature"] = active_temperature
 
     if active_provider == "GEMINI":
-        print(f"Using Gemini API as the LLM provider (Model: {active_model}).")
-        return await get_gemini_response(prompt, system_prompt, history, model_name=active_model, images=images)
+        print(f"Using Gemini API as the LLM provider (Model: {active_model}, Temp: {active_temperature}).")
+        return await get_gemini_response(prompt, system_prompt, history, model_name=active_model, images=images, temperature=active_temperature)
     elif active_provider == "LMSTUDIO":
-        print(f"Using LM Studio as the LLM provider (Model: {active_model or 'local-model'}).")
-        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images)
+        print(f"Using LM Studio as the LLM provider (Model: {active_model or 'local-model'}, Temp: {active_temperature}).")
+        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images, temperature=active_temperature)
     else:
         print(f"Error: Unknown LLM_PROVIDER '{active_provider}'. Defaulting to LMSTUDIO.")
-        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images)
+        return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images, temperature=active_temperature)
 
 
 async def get_llm_response(
@@ -69,7 +89,9 @@ async def get_llm_response(
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
-    images: Optional[List[Dict[str, Any]]] = None
+    images: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    temperature: Optional[float] = None
 ) -> Optional[str]:
     """
     Gets a response from the configured LLM provider, optionally using web search grounding.
@@ -84,12 +106,25 @@ async def get_llm_response(
         provider (str): Optional override for LLM provider ('GEMINI' or 'LMSTUDIO').
         model (str): Optional override for model name.
         images (Optional[List[Dict[str, Any]]]): Optional images to include with the prompt.
+        metadata (Optional[Dict[str, Any]]): Optional dictionary to capture execution metadata (provider, model, grounding_used, temperature).
+        temperature (Optional[float]): Optional override for model temperature (e.g. 0.7).
 
     Returns:
         Optional[str]: Generated response string or error message.
     """
     if history is None:
         history = []
+
+    active_provider = (provider or _get_default_provider()).upper()
+    active_model = model or _get_default_model(active_provider)
+    active_temperature = temperature if temperature is not None else _get_default_temperature()
+
+    if metadata is not None:
+        metadata["provider"] = active_provider
+        metadata["model"] = active_model or ("gemini-2.0-flash" if active_provider == "GEMINI" else "local-model")
+        metadata["grounding_enabled"] = grounding
+        metadata["grounding_used"] = False
+        metadata["temperature"] = active_temperature
 
     if grounding:
         async def _query_helper(
@@ -103,7 +138,9 @@ async def get_llm_response(
                 thinking_enabled=thinking_enabled,
                 provider=provider,
                 model=model,
-                images=imgs
+                images=imgs,
+                metadata=metadata,
+                temperature=active_temperature
             )
 
         return await run_search_augmented_generation(
@@ -112,7 +149,8 @@ async def get_llm_response(
             history=history,
             query_llm_fn=_query_helper,
             status_callback=status_callback,
-            images=images
+            images=images,
+            metadata=metadata
         )
 
     return await query_llm(
@@ -122,5 +160,7 @@ async def get_llm_response(
         thinking_enabled=thinking_enabled,
         provider=provider,
         model=model,
-        images=images
+        images=images,
+        metadata=metadata,
+        temperature=active_temperature
     )
