@@ -6,7 +6,11 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Mock non-standard library packages if not installed in the test environment
-for mod in ["aiohttp", "google", "google.genai", "google.genai.types", "dotenv", "discord", "ddgs", "duckduckgo_search"]:
+for mod in [
+    "aiohttp", "google", "google.genai", "google.genai.types", "dotenv",
+    "discord", "discord.ext", "discord.ext.commands", "discord.app_commands",
+    "ddgs", "duckduckgo_search"
+]:
     if mod not in sys.modules:
         try:
             __import__(mod)
@@ -274,6 +278,116 @@ class TestGeminiFallbackAndTimeout(unittest.IsolatedAsyncioTestCase):
             call_kwargs = mock_lmstudio.call_args.kwargs
             self.assertNotIn("fallback_model", call_kwargs)
             self.assertNotIn("timeout", call_kwargs)
+
+
+class TestMessageTriggerCriteria(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        class DummyBot:
+            MAX_ROLE_MEMBERS_FOR_PING = 5
+            def __init__(self, user):
+                self.user = user
+
+        self.bot = DummyBot(MagicMock(id=12345, name="TestBot"))
+        from bot import should_respond_to_message
+        self.should_respond = lambda msg: should_respond_to_message(self.bot, msg)
+
+    async def test_ignore_own_message(self):
+        msg = MagicMock()
+        msg.author = self.bot.user
+        self.assertFalse(await self.should_respond(msg))
+
+    async def test_direct_mention_responds(self):
+        msg = MagicMock()
+        msg.author = MagicMock(id=999)
+        msg.guild = MagicMock()
+        msg.mentions = [self.bot.user]
+        msg.mention_everyone = False
+        msg.role_mentions = []
+        self.assertTrue(await self.should_respond(msg))
+
+    async def test_everyone_here_ignored(self):
+        msg = MagicMock()
+        msg.author = MagicMock(id=999)
+        msg.guild = MagicMock()
+        msg.mentions = []  # Not directly mentioned
+        msg.mention_everyone = True
+        msg.role_mentions = []
+        self.assertFalse(await self.should_respond(msg))
+
+    async def test_role_mention_with_under_5_members_responds(self):
+        msg = MagicMock()
+        msg.author = MagicMock(id=999)
+        guild = MagicMock()
+        msg.guild = guild
+
+        # Role with 2 members
+        small_role = MagicMock(id=888, name="SmallRole")
+        small_role.is_default.return_value = False
+        small_role.members = [MagicMock(), MagicMock()]  # 2 members (< 5)
+
+        # Bot is in this role
+        bot_member = MagicMock()
+        bot_member.roles = [small_role]
+        guild.me = bot_member
+
+        msg.mentions = []
+        msg.mention_everyone = False
+        msg.role_mentions = [small_role]
+
+        self.assertTrue(await self.should_respond(msg))
+
+    async def test_role_mention_with_5_or_more_members_ignored(self):
+        msg = MagicMock()
+        msg.author = MagicMock(id=999)
+        guild = MagicMock()
+        msg.guild = guild
+
+        # Role with 6 members
+        large_role = MagicMock(id=777, name="LargeRole")
+        large_role.is_default.return_value = False
+        large_role.members = [MagicMock() for _ in range(6)]  # 6 members (>= 5)
+
+        # Bot is in this role
+        bot_member = MagicMock()
+        bot_member.roles = [large_role]
+        guild.me = bot_member
+
+        msg.mentions = []
+        msg.mention_everyone = False
+        msg.role_mentions = [large_role]
+
+        self.assertFalse(await self.should_respond(msg))
+
+    async def test_role_mention_not_assigned_to_bot_ignored(self):
+        msg = MagicMock()
+        msg.author = MagicMock(id=999)
+        guild = MagicMock()
+        msg.guild = guild
+
+        # Role with 2 members, but bot is NOT in it
+        other_role = MagicMock(id=666, name="OtherRole")
+        other_role.is_default.return_value = False
+        other_role.members = [MagicMock(), MagicMock()]
+
+        # Bot has different roles
+        bot_member = MagicMock()
+        bot_member.roles = []
+        guild.me = bot_member
+
+        msg.mentions = []
+        msg.mention_everyone = False
+        msg.role_mentions = [other_role]
+
+        self.assertFalse(await self.should_respond(msg))
+
+    def test_role_mention_prompt_cleaning(self):
+        role = MagicMock(id=888)
+        content = f"<@&888> Tell me a joke @everyone"
+        cleaned = content.replace(f'<@!{self.bot.user.id}>', '').replace(f'<@{self.bot.user.id}>', '')
+        cleaned = cleaned.replace(f'<@&{role.id}>', '')
+        cleaned = cleaned.replace('@everyone', '').replace('@here', '').strip()
+        self.assertEqual(cleaned, "Tell me a joke")
 
 
 if __name__ == "__main__":

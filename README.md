@@ -149,7 +149,7 @@ Interact with the bot in your Discord server using these slash commands:
 -   `/random <True|False>`: Toggles using a random prompt for each reply.
 -   `/think <True|False>`: Toggles whether the bot shows its thought process (LM Studio only).
 -   `/grounding <True|False>`: Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader). Also available as `/websearch`.
--   **Mention the bot**: You can have a conversation with the bot by mentioning it directly (e.g., `@YourBotName What is the capital of France?`).
+-   **Mention the bot**: You can have a conversation with the bot by mentioning it directly (e.g., `@YourBotName What is the capital of France?`) or by pinging an assigned role with less than 5 members (e.g., `@MyAI What is Python?`). Mass mentions like `@everyone` and `@here` are automatically ignored.
 -   **Image Analysis & Verification**:
     - **Reply to an image**: Reply to any message in the channel containing an image or screenshot, mention the bot, and ask your question (e.g., `@YourBotName is this true?` or `@YourBotName what is this?`).
     - **Direct image upload**: Attach an image directly to your message and mention the bot.

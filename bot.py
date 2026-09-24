@@ -133,10 +133,72 @@ async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, A
 
     return images
 
+MAX_ROLE_MEMBERS_FOR_PING = 5
+
+
+async def should_respond_to_message(bot: Any, message: discord.Message) -> bool:
+    """
+    Determines whether the bot should respond to an incoming message.
+
+    Rules:
+    - Never respond to messages sent by the bot itself.
+    - Ignore @everyone and @here pings (unless the bot is explicitly mentioned directly).
+    - Respond to direct user mentions (@BotName).
+    - Respond to direct messages (DMs).
+    - Respond to role pings (@RoleName) if the role is assigned to the bot
+      and the role has less than 5 members.
+    """
+    if message.author == bot.user:
+        return False
+
+    # In direct messages (DMs), always respond
+    if message.guild is None:
+        return True
+
+    # Check for explicit direct user mention (@BotName)
+    if bot.user in message.mentions:
+        return True
+
+    # Check for role mentions
+    if message.role_mentions:
+        bot_member = message.guild.me
+        if bot_member is None:
+            bot_member = message.guild.get_member(bot.user.id)
+        if bot_member is None:
+            try:
+                bot_member = await message.guild.fetch_member(bot.user.id)
+            except Exception as e:
+                print(f"Could not fetch bot member in guild {message.guild.id}: {e}")
+                bot_member = None
+
+        bot_roles = set(bot_member.roles) if bot_member else set()
+
+        for role in message.role_mentions:
+            # Ignore @everyone default role
+            if role.is_default():
+                continue
+
+            # The role must be assigned to the bot
+            if role not in bot_roles:
+                continue
+
+            # Only respond if the role has less than 5 members
+            member_count = len(role.members) if hasattr(role, 'members') and role.members is not None else 1
+            if member_count < MAX_ROLE_MEMBERS_FOR_PING:
+                print(f"Triggered by role ping '@{role.name}' ({member_count} member(s) < {MAX_ROLE_MEMBERS_FOR_PING}) in #{message.channel}")
+                return True
+            else:
+                print(f"Ignored role ping '@{role.name}': has {member_count} member(s) (must be < {MAX_ROLE_MEMBERS_FOR_PING})")
+
+    return False
+
+
 class LLMBot(commands.Bot):
     """
     A Discord bot that uses slash commands to interact with a configured LLM.
     """
+    MAX_ROLE_MEMBERS_FOR_PING = MAX_ROLE_MEMBERS_FOR_PING
+
     def __init__(self):
         """
         Initializes the bot. The LLM provider is configured via environment variables.
@@ -145,6 +207,8 @@ class LLMBot(commands.Bot):
         intents.messages = True
         intents.message_content = True
         intents.guilds = True
+        if os.getenv("ENABLE_MEMBERS_INTENT", "false").lower() == "true":
+            intents.members = True
         # The prefix is required but won't be used for slash commands.
         super().__init__(command_prefix="!", intents=intents)
 
@@ -268,12 +332,16 @@ class LLMBot(commands.Bot):
         print('Bot is ready to receive commands and messages.')
         print('------')
 
+    async def should_respond(self, message: discord.Message) -> bool:
+        """Determines whether the bot should respond to an incoming message."""
+        return await should_respond_to_message(self, message)
+
     async def on_message(self, message: discord.Message):
-        """Handles direct mentions to the bot."""
+        """Handles direct and role mentions to the bot."""
         if message.author == self.user:
             return
 
-        if self.user.mentioned_in(message):
+        if await self.should_respond(message):
             status_msg = None
             try:
                 has_urls = bool(re.search(r'https?://', message.content))
@@ -284,7 +352,10 @@ class LLMBot(commands.Bot):
                 else:
                     status_msg = await message.reply("⏳ Generating response...", mention_author=False)
 
-                prompt = message.content.replace(f'<@!{self.user.id}>', '').replace(f'<@{self.user.id}>', '').strip()
+                prompt = message.content.replace(f'<@!{self.user.id}>', '').replace(f'<@{self.user.id}>', '')
+                for role in message.role_mentions:
+                    prompt = prompt.replace(f'<@&{role.id}>', '')
+                prompt = prompt.replace('@everyone', '').replace('@here', '').strip()
                 images: List[Dict[str, Any]] = []
 
                 # Check if the message is a reply
