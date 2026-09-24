@@ -43,6 +43,37 @@ def _get_default_temperature() -> float:
     return 0.7
 
 
+def _get_default_fallback_model(provider: str) -> Optional[str]:
+    """Reads default fallback model from settings.json or falls back to env."""
+    if provider != "GEMINI":
+        return None
+    try:
+        with open("settings.json", "r") as f:
+            data = json.load(f)
+            if "gemini_fallback_model" in data and data["gemini_fallback_model"]:
+                return data["gemini_fallback_model"]
+    except Exception:
+        pass
+    return os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
+
+
+def _get_default_timeout(provider: str) -> Optional[float]:
+    """Reads default timeout from settings.json or falls back to env."""
+    if provider != "GEMINI":
+        return None
+    try:
+        with open("settings.json", "r") as f:
+            data = json.load(f)
+            if "gemini_timeout" in data and data["gemini_timeout"] is not None:
+                return float(data["gemini_timeout"])
+    except Exception:
+        pass
+    try:
+        return float(os.getenv("GEMINI_TIMEOUT", 30.0))
+    except ValueError:
+        return 30.0
+
+
 async def query_llm(
     prompt: str,
     system_prompt: str,
@@ -52,7 +83,10 @@ async def query_llm(
     model: Optional[str] = None,
     images: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
+    fallback_model: Optional[str] = None,
+    timeout: Optional[float] = None,
+    status_callback: Optional[Callable[[str], Awaitable[None]]] = None
 ) -> Optional[str]:
     """
     Sends a request to the configured LLM provider (Gemini or LM Studio).
@@ -70,8 +104,21 @@ async def query_llm(
         metadata["temperature"] = active_temperature
 
     if active_provider == "GEMINI":
-        print(f"Using Gemini API as the LLM provider (Model: {active_model}, Temp: {active_temperature}).")
-        return await get_gemini_response(prompt, system_prompt, history, model_name=active_model, images=images, temperature=active_temperature)
+        active_fallback = fallback_model or _get_default_fallback_model(active_provider)
+        active_timeout = timeout if timeout is not None else _get_default_timeout(active_provider)
+        print(f"Using Gemini API as the LLM provider (Model: {active_model}, Fallback: {active_fallback}, Temp: {active_temperature}, Timeout: {active_timeout}s).")
+        return await get_gemini_response(
+            prompt,
+            system_prompt,
+            history,
+            model_name=active_model,
+            images=images,
+            temperature=active_temperature,
+            fallback_model=active_fallback,
+            timeout=active_timeout,
+            metadata=metadata,
+            status_callback=status_callback
+        )
     elif active_provider == "LMSTUDIO":
         print(f"Using LM Studio as the LLM provider (Model: {active_model or 'local-model'}, Temp: {active_temperature}).")
         return await get_lmstudio_response(prompt, system_prompt, thinking_enabled, history, model_name=active_model, images=images, temperature=active_temperature)
@@ -91,7 +138,9 @@ async def get_llm_response(
     model: Optional[str] = None,
     images: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
+    fallback_model: Optional[str] = None,
+    timeout: Optional[float] = None
 ) -> Optional[str]:
     """
     Gets a response from the configured LLM provider, optionally using web search grounding.
@@ -108,6 +157,8 @@ async def get_llm_response(
         images (Optional[List[Dict[str, Any]]]): Optional images to include with the prompt.
         metadata (Optional[Dict[str, Any]]): Optional dictionary to capture execution metadata (provider, model, grounding_used, temperature).
         temperature (Optional[float]): Optional override for model temperature (e.g. 0.7).
+        fallback_model (Optional[str]): Optional fallback model name for Gemini.
+        timeout (Optional[float]): Optional request timeout in seconds for Gemini.
 
     Returns:
         Optional[str]: Generated response string or error message.
@@ -140,7 +191,10 @@ async def get_llm_response(
                 model=model,
                 images=imgs,
                 metadata=metadata,
-                temperature=active_temperature
+                temperature=active_temperature,
+                fallback_model=fallback_model,
+                timeout=timeout,
+                status_callback=status_callback
             )
 
         return await run_search_augmented_generation(
@@ -162,5 +216,8 @@ async def get_llm_response(
         model=model,
         images=images,
         metadata=metadata,
-        temperature=active_temperature
+        temperature=active_temperature,
+        fallback_model=fallback_model,
+        timeout=timeout,
+        status_callback=status_callback
     )

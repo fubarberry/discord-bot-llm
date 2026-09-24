@@ -3,6 +3,8 @@ This Discord bot allows you to chat with an AI, powered by either a local model 
 ## Features
 
 - **Dual Backend Support**: Choose between a local LM Studio server or the Google Gemini API.
+- **Gemini Fallback & Overload Protection**: Automatically switches to a fallback model (defaults to `gemini-2.5-flash-lite`) if the primary model is overloaded (503), unavailable, or exceeds the request timeout, including footer indicators (`-# Fallback model used: ...`).
+- **Configurable Request Timeout**: Built-in timeout prevents indefinite hangs when upstream Gemini services experience peak load.
 - **Image & Vision Processing**: Attach images or reply to messages with images and mention the bot (e.g. `@YourBotName is this real?`). Supported natively with Google Gemini API and via local vision models in LM Studio.
 - **Autonomous Web Search Grounding**: Automatically searches the web via DuckDuckGo and reads pages via Jina Reader when questions need real-time data, with live status progress messages.
 - **Slash Commands**: Modern and user-friendly `/` commands with autocomplete.
@@ -142,6 +144,8 @@ Interact with the bot in your Discord server using these slash commands:
 -   `/setprompt <name>`: Changes the bot's personality. Start typing a name, and it will autocomplete with available presets. You can also type your own custom prompt directly.
 -   `/provider <LM Studio|Gemini>`: Switches the active LLM provider (Admin only). Also available as `/source`.
 -   `/model <name>`: Changes the active model name (Admin only, with preset autocomplete for Gemini models).
+-   `/fallbackmodel <name>`: Changes the Gemini fallback model (Admin only, defaults to `gemini-2.5-flash-lite`).
+-   `/timeout <seconds>`: Sets the Gemini request timeout in seconds (Admin only, defaults to `30.0`).
 -   `/random <True|False>`: Toggles using a random prompt for each reply.
 -   `/think <True|False>`: Toggles whether the bot shows its thought process (LM Studio only).
 -   `/grounding <True|False>`: Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader). Also available as `/websearch`.

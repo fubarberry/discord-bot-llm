@@ -160,6 +160,8 @@ class LLMBot(commands.Bot):
         self.grounding_enabled = self.settings.get("grounding_enabled", False)
         self.llm_provider = self.settings.get("llm_provider", os.getenv("LLM_PROVIDER", "LMSTUDIO")).upper()
         self.gemini_model = self.settings.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
+        self.gemini_fallback_model = self.settings.get("gemini_fallback_model", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite"))
+        self.gemini_timeout = float(self.settings.get("gemini_timeout", os.getenv("GEMINI_TIMEOUT", 30.0)))
         self.run_in_background = self.settings.get("run_in_background", os.getenv("RUN_IN_BACKGROUND", "false").lower() == "true")
         self.max_history = int(self.settings.get("max_history", os.getenv("MAX_HISTORY", 15)))
         self.temperature = float(self.settings.get("temperature", 0.7))
@@ -168,7 +170,7 @@ class LLMBot(commands.Bot):
         self.last_response_info = None # Information about the last response generated
         
         self.message_history = {}
-        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Temp: {self.temperature}, Prompt: {self.prompt_name}). Connecting to Discord...")
+        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Fallback: {self.gemini_fallback_model}, Timeout: {self.gemini_timeout}s, Temp: {self.temperature}, Prompt: {self.prompt_name}). Connecting to Discord...")
 
     def get_prompt_name(self, prompt_text: str) -> str:
         """Returns the preset name matching prompt_text, or 'custom' if none match."""
@@ -232,6 +234,8 @@ class LLMBot(commands.Bot):
             "grounding_enabled": self.grounding_enabled,
             "llm_provider": self.llm_provider,
             "gemini_model": self.gemini_model,
+            "gemini_fallback_model": self.gemini_fallback_model,
+            "gemini_timeout": self.gemini_timeout,
             "run_in_background": self.run_in_background,
             "max_history": self.max_history,
             "temperature": self.temperature
@@ -404,7 +408,9 @@ class LLMBot(commands.Bot):
                     model=self.gemini_model if self.llm_provider == "GEMINI" else None,
                     images=images if images else None,
                     metadata=resp_metadata,
-                    temperature=self.temperature
+                    temperature=self.temperature,
+                    fallback_model=self.gemini_fallback_model if self.llm_provider == "GEMINI" else None,
+                    timeout=self.gemini_timeout if self.llm_provider == "GEMINI" else None
                 )
 
                 if llm_response:
@@ -418,7 +424,10 @@ class LLMBot(commands.Bot):
                         "system_prompt": current_system_prompt,
                         "prompt_name": current_prompt_name,
                         "random_mode": self.random_mode,
-                        "image_processing_used": bool(images and len(images) > 0)
+                        "image_processing_used": bool(images and len(images) > 0),
+                        "fallback_used": resp_metadata.get("fallback_used", False),
+                        "fallback_model": resp_metadata.get("fallback_model"),
+                        "primary_model": resp_metadata.get("primary_model")
                     }
 
                     # If this is an error reported from the LLM provider, show it directly without saving to history
@@ -450,6 +459,11 @@ class LLMBot(commands.Bot):
                     if (current_prompt_name and current_prompt_name.lower() != "default") or self.random_mode:
                         random_suffix = " (random)" if self.random_mode else ""
                         discord_response = f"{discord_response.rstrip()}\n-# System prompt: {current_prompt_name}{random_suffix}"
+
+                    # Append notice if fallback model was used
+                    if resp_metadata.get("fallback_used"):
+                        used_fallback = resp_metadata.get("fallback_model") or self.gemini_fallback_model
+                        discord_response = f"{discord_response.rstrip()}\n-# Fallback model used: {used_fallback}"
 
                     if len(discord_response) > 2000:
                         parts = [discord_response[i:i+2000] for i in range(0, len(discord_response), 2000)]
@@ -528,6 +542,7 @@ async def info_command(interaction: discord.Interaction):
         image_used = "Yes" if info.get("image_processing_used") else "No"
         sys_prompt = info.get("system_prompt", "N/A")
         prompt_name = info.get("prompt_name") or bot.get_prompt_name(sys_prompt)
+        fallback_used_str = "Yes" if info.get("fallback_used") else "No"
 
         embed.description = "Information for the **last response generated**:"
         embed.add_field(name="🤖 LLM Provider", value=f"**{provider_name}** (`{provider_val}`)", inline=True)
@@ -537,6 +552,10 @@ async def info_command(interaction: discord.Interaction):
         embed.add_field(name="🌍 Grounding Setting", value=f"**{grounding_on}**", inline=True)
         embed.add_field(name="🔍 Grounding Used", value=f"**{grounding_used}**", inline=True)
         embed.add_field(name="🖼️ Image Processing Used", value=f"**{image_used}**", inline=True)
+        if provider_val == "GEMINI":
+            fb_model = info.get("fallback_model") or bot.gemini_fallback_model
+            embed.add_field(name="🛡️ Fallback Model", value=f"`{fb_model}`", inline=True)
+            embed.add_field(name="🔄 Fallback Used", value=f"**{fallback_used_str}**", inline=True)
 
         prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
         embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
@@ -559,6 +578,9 @@ async def info_command(interaction: discord.Interaction):
         embed.add_field(name="🌍 Grounding Setting", value=f"**{grounding_on}**", inline=True)
         embed.add_field(name="🔍 Grounding Used", value="*N/A (No responses yet)*", inline=True)
         embed.add_field(name="🖼️ Image Processing Used", value="*N/A (No responses yet)*", inline=True)
+        if provider_val == "GEMINI":
+            embed.add_field(name="🛡️ Fallback Model", value=f"`{bot.gemini_fallback_model}`", inline=True)
+            embed.add_field(name="🔄 Fallback Used", value="*N/A (No responses yet)*", inline=True)
 
         prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
         embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
@@ -606,6 +628,7 @@ async def websearch_command(interaction: discord.Interaction, enabled: bool):
 
 POPULAR_GEMINI_MODELS = [
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
@@ -701,11 +724,59 @@ async def temp_command(interaction: discord.Interaction, value: float):
     bot.save_settings()
     await interaction.response.send_message(f"✅ Temperature updated to **{bot.temperature}**.", ephemeral=True)
 
+@app_commands.command(name="fallbackmodel", description="Change the Gemini fallback model (Admin only).")
+@app_commands.describe(name="Choose a preset model or enter a custom model name.")
+@app_commands.default_permissions(administrator=True)
+async def fallback_model_command(interaction: discord.Interaction, name: str):
+    if interaction.guild and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You do not have permission to use this command (Administrator required).", ephemeral=True)
+        return
+
+    bot = interaction.client
+    model_name = name.strip()
+    if not model_name:
+        await interaction.response.send_message(f"Current Gemini fallback model: `{bot.gemini_fallback_model}`.", ephemeral=True)
+        return
+
+    bot.gemini_fallback_model = model_name
+    bot.save_settings()
+    await interaction.response.send_message(f"✅ Fallback model updated to **{model_name}**.", ephemeral=True)
+
+@fallback_model_command.autocomplete('name')
+async def fallback_model_command_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    choices = [
+        app_commands.Choice(name=m, value=m)
+        for m in POPULAR_GEMINI_MODELS
+        if current.lower() in m.lower()
+    ]
+    if current and not any(c.value == current for c in choices):
+        choices.insert(0, app_commands.Choice(name=f"Custom: {current}", value=current))
+    return choices[:25]
+
+@app_commands.command(name="timeout", description="Set the Gemini request timeout in seconds (Admin only).")
+@app_commands.describe(seconds="Timeout in seconds (e.g. 30.0). Default is 30.0.")
+@app_commands.default_permissions(administrator=True)
+async def timeout_command(interaction: discord.Interaction, seconds: float):
+    if interaction.guild and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You do not have permission to use this command (Administrator required).", ephemeral=True)
+        return
+
+    if seconds < 5.0 or seconds > 300.0:
+        await interaction.response.send_message("❌ Timeout must be between 5.0 and 300.0 seconds.", ephemeral=True)
+        return
+
+    bot = interaction.client
+    bot.gemini_timeout = round(seconds, 1)
+    bot.save_settings()
+    await interaction.response.send_message(f"✅ Gemini timeout updated to **{bot.gemini_timeout}s**.", ephemeral=True)
+
 @app_commands.command(name="help", description="Shows the list of available commands.")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="Bot Commands", description="Here are the available slash commands:", color=discord.Color.green())
     embed.add_field(name="/provider [LM Studio|Gemini]", value="Switches the active LLM provider (Admin only). Alias: `/source`.", inline=False)
     embed.add_field(name="/model [name]", value="Changes the active model name (Admin only).", inline=False)
+    embed.add_field(name="/fallbackmodel [name]", value="Changes the Gemini fallback model (Admin only). Default: `gemini-2.5-flash-lite`.", inline=False)
+    embed.add_field(name="/timeout [seconds]", value="Sets the Gemini request timeout in seconds (Admin only). Default: `30.0`.", inline=False)
     embed.add_field(name="/temp [0.0 - 2.0]", value="Sets the model temperature between 0.0 and 2.0 (Admin only). Default is 0.7.", inline=False)
     embed.add_field(name="/setprompt [name|custom]", value="Sets the bot's system prompt. This disables random mode.", inline=False)
     embed.add_field(name="/info", value="Displays details about the last response generated and active configuration.", inline=False)
@@ -733,6 +804,8 @@ async def setup(bot: commands.Bot):
     bot.tree.add_command(provider_command)
     bot.tree.add_command(source_command)
     bot.tree.add_command(model_command)
+    bot.tree.add_command(fallback_model_command)
+    bot.tree.add_command(timeout_command)
     bot.tree.add_command(temp_command)
     bot.tree.add_command(setprompt)
     bot.tree.add_command(info_command)
