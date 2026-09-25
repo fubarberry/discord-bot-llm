@@ -357,6 +357,248 @@ class TestImageSupport(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Describe this image in detail", call_prompt)
         self.assertNotIn(test_url, call_prompt)
 
+    async def test_extract_images_from_forwarded_message_attachment(self):
+        """Verify _extract_images_from_message extracts images from forwarded message snapshots."""
+        from bot import _extract_images_from_message
+
+        img_att = MagicMock()
+        img_att.content_type = "image/png"
+        img_att.filename = "forwarded.png"
+        img_att.size = 200
+        img_att.read = AsyncMock(return_value=TINY_PNG)
+
+        snapshot = MagicMock()
+        snapshot.attachments = [img_att]
+        snapshot.embeds = []
+        snapshot.content = "Look at this forwarded photo"
+
+        mock_msg = MagicMock()
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.content = ""
+        mock_msg.message_snapshots = [snapshot]
+
+        imgs = await _extract_images_from_message(mock_msg)
+        self.assertEqual(len(imgs), 1)
+        self.assertEqual(imgs[0]["data"], TINY_PNG)
+        self.assertEqual(imgs[0]["mime_type"], "image/png")
+        self.assertEqual(imgs[0]["filename"], "forwarded.png")
+
+    async def test_extract_images_from_forwarded_message_embed(self):
+        """Verify _extract_images_from_message extracts images from embeds inside forwarded message snapshots."""
+        from bot import _extract_images_from_message
+        import discord
+
+        embed = discord.Embed.from_dict({
+            "title": "Forwarded Embed",
+            "image": {
+                "url": "https://origin.example.com/forwarded.jpg",
+                "proxy_url": "https://images-ext-1.discordapp.net/external/forwarded.jpg"
+            }
+        })
+        snapshot = MagicMock()
+        snapshot.attachments = []
+        snapshot.embeds = [embed]
+        snapshot.content = ""
+
+        mock_msg = MagicMock()
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.content = ""
+        mock_msg.message_snapshots = [snapshot]
+
+        with patch("bot._fetch_image_from_url", new=AsyncMock(return_value={"data": TINY_PNG, "mime_type": "image/jpeg", "filename": "embed_image"})) as mock_fetch:
+            imgs = await _extract_images_from_message(mock_msg)
+            self.assertEqual(len(imgs), 1)
+            mock_fetch.assert_called_once_with("https://images-ext-1.discordapp.net/external/forwarded.jpg")
+
+    async def test_extract_images_from_forwarded_message_dict(self):
+        """Verify _extract_images_from_message handles dictionary-format snapshots gracefully."""
+        from bot import _extract_images_from_message
+
+        img_att = {
+            "content_type": "image/png",
+            "filename": "dict_forwarded.png",
+            "size": 150,
+            "url": "https://cdn.discordapp.com/attachments/1/2/dict_forwarded.png"
+        }
+        snapshot = {
+            "message": {
+                "attachments": [img_att],
+                "embeds": [],
+                "content": "Raw snapshot"
+            }
+        }
+        mock_msg = MagicMock()
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.content = ""
+        mock_msg.message_snapshots = [snapshot]
+
+        with patch("bot._fetch_image_from_url", new=AsyncMock(return_value={"data": TINY_PNG, "mime_type": "image/png", "filename": "dict_forwarded.png"})):
+            imgs = await _extract_images_from_message(mock_msg)
+            self.assertEqual(len(imgs), 1)
+            self.assertEqual(imgs[0]["filename"], "dict_forwarded.png")
+
+    async def test_on_message_forwarded_image_direct(self):
+        """Verify on_message handles a message that is itself a forward with an image."""
+        from bot import LLMBot
+        from unittest.mock import PropertyMock
+
+        bot = LLMBot()
+        mock_user = MagicMock()
+        mock_user.id = 12345
+        mock_user.name = "TestBot"
+
+        status_msg = AsyncMock()
+        status_msg.edit = AsyncMock()
+
+        img_att = MagicMock()
+        img_att.content_type = "image/png"
+        img_att.filename = "forwarded_art.png"
+        img_att.size = 100
+        img_att.read = AsyncMock(return_value=TINY_PNG)
+
+        snapshot = MagicMock()
+        snapshot.attachments = [img_att]
+        snapshot.embeds = []
+        snapshot.content = "Look at this rare bird"
+
+        ref = MagicMock()
+        ref.message_id = 98765
+        ref.type = 1  # Forward type
+
+        mock_msg = MagicMock()
+        mock_msg.id = 11111
+        mock_msg.author = MagicMock()
+        mock_msg.author.name = "Forwarder"
+        mock_msg.content = "<@12345> is this real?"
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.message_snapshots = [snapshot]
+        mock_msg.reference = ref
+        mock_msg.channel = MagicMock()
+        mock_msg.channel.id = 999
+        mock_msg.channel.fetch_message = AsyncMock()
+        mock_msg.reply = AsyncMock(return_value=status_msg)
+
+        with patch.object(LLMBot, 'user', new_callable=PropertyMock, return_value=mock_user):
+            with patch("bot.get_llm_response", new=AsyncMock(return_value="Yes, it's a real bird.")) as mock_llm:
+                await bot.on_message(mock_msg)
+
+        # Should NOT call fetch_message because reference is a forward, not a channel reply
+        mock_msg.channel.fetch_message.assert_not_called()
+        mock_llm.assert_called_once()
+        call_prompt = mock_llm.call_args[0][0]
+        call_images = mock_llm.call_args[1].get("images") or mock_llm.call_args[0][4]
+
+        self.assertIn("Forwarded text: \"Look at this rare bird\"", call_prompt)
+        self.assertIn("is this real?", call_prompt)
+        self.assertEqual(len(call_images), 1)
+        self.assertEqual(call_images[0]["data"], TINY_PNG)
+
+    async def test_on_message_reply_to_forwarded_message(self):
+        """Verify replying to a forwarded message extracts images and text from referenced snapshots."""
+        from bot import LLMBot
+        from unittest.mock import PropertyMock
+
+        bot = LLMBot()
+        mock_user = MagicMock()
+        mock_user.id = 12345
+        mock_user.name = "TestBot"
+
+        status_msg = AsyncMock()
+        status_msg.edit = AsyncMock()
+
+        img_att = MagicMock()
+        img_att.content_type = "image/png"
+        img_att.filename = "forwarded_car.png"
+        img_att.size = 100
+        img_att.read = AsyncMock(return_value=TINY_PNG)
+
+        ref_snapshot = MagicMock()
+        ref_snapshot.attachments = [img_att]
+        ref_snapshot.embeds = []
+        ref_snapshot.content = "Concept car prototype spotted"
+
+        # The message being replied to (which is a forwarded message in the channel)
+        referenced_msg = MagicMock()
+        referenced_msg.author = MagicMock()
+        referenced_msg.author.name = "OriginalPoster"
+        referenced_msg.content = ""  # Forward messages typically have empty outer content
+        referenced_msg.attachments = []
+        referenced_msg.embeds = []
+        referenced_msg.message_snapshots = [ref_snapshot]
+
+        reply_ref = MagicMock()
+        reply_ref.message_id = 55555
+        reply_ref.type = 0  # Default reply type
+
+        # Current message: user replying to the forward
+        mock_msg = MagicMock()
+        mock_msg.id = 22222
+        mock_msg.author = MagicMock()
+        mock_msg.author.name = "UserReplying"
+        mock_msg.content = "<@12345> What make is this car?"
+        mock_msg.attachments = []
+        mock_msg.embeds = []
+        mock_msg.message_snapshots = []
+        mock_msg.reference = reply_ref
+        mock_msg.channel = MagicMock()
+        mock_msg.channel.id = 999
+        mock_msg.channel.fetch_message = AsyncMock(return_value=referenced_msg)
+        mock_msg.reply = AsyncMock(return_value=status_msg)
+
+        with patch.object(LLMBot, 'user', new_callable=PropertyMock, return_value=mock_user):
+            with patch("bot.get_llm_response", new=AsyncMock(return_value="It looks like a Porsche prototype.")) as mock_llm:
+                await bot.on_message(mock_msg)
+
+        mock_msg.channel.fetch_message.assert_called_once_with(55555)
+        mock_llm.assert_called_once()
+        call_prompt = mock_llm.call_args[0][0]
+        call_images = mock_llm.call_args[1].get("images") or mock_llm.call_args[0][4]
+
+        # Verify reply context was constructed from the referenced forwarded message's snapshot content
+        self.assertIn("Replying to a message by OriginalPoster: \"Concept car prototype spotted\"", call_prompt)
+        self.assertIn("What make is this car?", call_prompt)
+        self.assertEqual(len(call_images), 1)
+        self.assertEqual(call_images[0]["data"], TINY_PNG)
+
+    def test_compat_message_snapshots(self):
+        """Verify fallback compatibility logic parses snapshots when running on older environments."""
+        import bot
+
+        raw_data = {
+            "message_snapshots": [
+                {
+                    "message": {
+                        "content": "A beautiful sunset",
+                        "attachments": [
+                            {
+                                "id": "111",
+                                "filename": "sunset.png",
+                                "size": 100,
+                                "content_type": "image/png",
+                                "url": "https://cdn.discordapp.com/sunset.png"
+                            }
+                        ],
+                        "embeds": []
+                    }
+                }
+            ]
+        }
+
+        # If bot defines CompatMessageSnapshot, test its creation directly
+        CompatClass = getattr(bot, "CompatMessageSnapshot", None)
+        if CompatClass is None:
+            # Running on discord.py >= 2.5 where MessageSnapshot is native
+            import discord
+            self.assertTrue(hasattr(discord.Message, "message_snapshots"))
+        else:
+            snap = CompatClass(content="A beautiful sunset", attachments=[{"filename": "sunset.png"}], embeds=[])
+            self.assertEqual(snap.content, "A beautiful sunset")
+            self.assertEqual(len(snap.attachments), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-discord.py[standard]==2.3.2
+discord.py[standard]>=2.5.0
 python-dotenv==1.0.1
 aiohttp>=3.10.11
 google-genai

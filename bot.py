@@ -20,21 +20,75 @@ MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB limit
 MAX_IMAGES = 5
 
 
-async def _fetch_image_from_attachment(attachment: discord.Attachment) -> Optional[Dict[str, Any]]:
-    """Downloads and returns image data if attachment is a supported image."""
-    content_type = attachment.content_type or ""
-    is_image = content_type.startswith("image/") or attachment.filename.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+# Backward compatibility patch for discord.py versions < 2.5 that do not parse message_snapshots
+if not hasattr(discord.Message, "message_snapshots"):
+    class CompatMessageSnapshot:
+        """Lightweight snapshot representing a forwarded message for older discord.py versions."""
+        def __init__(self, content: str = "", attachments: Optional[List[Any]] = None, embeds: Optional[List[Any]] = None):
+            self.content = content
+            self.attachments = attachments or []
+            self.embeds = embeds or []
+
+    _orig_message_update = discord.Message._update
+
+    def _compat_message_update(self, data: Dict[str, Any]):
+        _orig_message_update(self, data)
+        raw_snapshots = data.get("message_snapshots", [])
+        snapshots = []
+        for snap in raw_snapshots:
+            msg_data = snap.get("message", {}) if isinstance(snap, dict) else {}
+            atts = []
+            for a in msg_data.get("attachments", []):
+                try:
+                    atts.append(discord.Attachment(data=a, state=self._state))
+                except Exception:
+                    atts.append(a)
+            embs = []
+            for e in msg_data.get("embeds", []):
+                try:
+                    embs.append(discord.Embed.from_dict(e))
+                except Exception:
+                    pass
+            content = msg_data.get("content", "")
+            snapshots.append(CompatMessageSnapshot(content=content, attachments=atts, embeds=embs))
+        self.message_snapshots = snapshots
+
+    discord.Message._update = _compat_message_update
+
+
+async def _fetch_image_from_attachment(attachment: Any) -> Optional[Dict[str, Any]]:
+    """Downloads and returns image data if attachment is a supported image (supports discord.Attachment or dict)."""
+    if isinstance(attachment, dict):
+        content_type = attachment.get("content_type") or ""
+        filename = attachment.get("filename") or ""
+        size = attachment.get("size") or 0
+        url = attachment.get("url") or attachment.get("proxy_url")
+        is_image = content_type.startswith("image/") or filename.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+        if not is_image or size > MAX_IMAGE_SIZE:
+            return None
+        if url:
+            return await _fetch_image_from_url(url)
+        return None
+
+    content_type = getattr(attachment, "content_type", "") or ""
+    filename = getattr(attachment, "filename", "") or ""
+    size = getattr(attachment, "size", 0) or 0
+    is_image = content_type.startswith("image/") or filename.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
     if not is_image:
         return None
-    if attachment.size > MAX_IMAGE_SIZE:
-        print(f"Skipping attachment {attachment.filename}: size {attachment.size} exceeds 20MB limit.")
+    if size > MAX_IMAGE_SIZE:
+        print(f"Skipping attachment {filename}: size {size} exceeds 20MB limit.")
         return None
     try:
         data = await attachment.read()
         mime = content_type if content_type.startswith("image/") else "image/png"
-        return {"data": data, "mime_type": mime, "filename": attachment.filename}
+        return {"data": data, "mime_type": mime, "filename": filename}
     except Exception as e:
-        print(f"Error reading attachment {attachment.filename}: {e}")
+        print(f"Error reading attachment {filename}: {e}")
+        # Fall back to URL fetch if attachment.read() fails
+        url = getattr(attachment, "url", None) or getattr(attachment, "proxy_url", None)
+        if url:
+            return await _fetch_image_from_url(url)
         return None
 
 
@@ -71,38 +125,44 @@ async def _fetch_image_from_url(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, Any]]:
-    """Extracts images from message attachments, embeds, and direct media URLs."""
-    images = []
-    seen_urls = set()
-
+async def _extract_images_from_source(
+    attachments: Optional[List[Any]],
+    embeds: Optional[List[Any]],
+    content: Optional[str],
+    seen_urls: set,
+    current_images: List[Dict[str, Any]],
+    max_images: int = MAX_IMAGES
+) -> None:
+    """Helper to extract images from attachments, embeds, and content URLs into current_images."""
     # 1. Attachments
-    if msg.attachments:
-        for att in msg.attachments:
+    if attachments:
+        for att in attachments:
+            if len(current_images) >= max_images:
+                return
             img = await _fetch_image_from_attachment(att)
             if img:
-                images.append(img)
-                if len(images) >= MAX_IMAGES:
-                    return images
+                current_images.append(img)
+                if len(current_images) >= max_images:
+                    return
 
-    # 2. Embeds (try Discord proxy_url first, then direct url)
-    if len(images) < MAX_IMAGES and msg.embeds:
-        for embed in msg.embeds:
+    # 2. Embeds
+    if len(current_images) < max_images and embeds:
+        for embed in embeds:
             urls_to_try = []
-            if embed.image:
-                if embed.image.proxy_url:
+            if getattr(embed, "image", None):
+                if getattr(embed.image, "proxy_url", None):
                     urls_to_try.append(embed.image.proxy_url)
-                if embed.image.url and embed.image.url != embed.image.proxy_url:
+                if getattr(embed.image, "url", None) and embed.image.url != embed.image.proxy_url:
                     urls_to_try.append(embed.image.url)
-            if embed.thumbnail:
-                if embed.thumbnail.proxy_url:
+            if getattr(embed, "thumbnail", None):
+                if getattr(embed.thumbnail, "proxy_url", None):
                     urls_to_try.append(embed.thumbnail.proxy_url)
-                if embed.thumbnail.url and embed.thumbnail.url != embed.thumbnail.proxy_url:
+                if getattr(embed.thumbnail, "url", None) and embed.thumbnail.url != embed.thumbnail.proxy_url:
                     urls_to_try.append(embed.thumbnail.url)
-            if embed.video:
-                if embed.video.proxy_url:
+            if getattr(embed, "video", None):
+                if getattr(embed.video, "proxy_url", None):
                     urls_to_try.append(embed.video.proxy_url)
-                if embed.video.url and embed.video.url != embed.video.proxy_url:
+                if getattr(embed.video, "url", None) and embed.video.url != embed.video.proxy_url:
                     urls_to_try.append(embed.video.url)
 
             for u in urls_to_try:
@@ -111,14 +171,14 @@ async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, A
                 seen_urls.add(u)
                 img = await _fetch_image_from_url(u)
                 if img:
-                    images.append(img)
-                    if len(images) >= MAX_IMAGES:
-                        return images
+                    current_images.append(img)
+                    if len(current_images) >= max_images:
+                        return
                     break
 
-    # 3. Direct URLs in message text (e.g. image URLs or media embed links)
-    if len(images) < MAX_IMAGES and msg.content and isinstance(msg.content, str):
-        url_matches = re.findall(r'https?://[^\s<>"\'`]+', msg.content)
+    # 3. Direct URLs in message text
+    if len(current_images) < max_images and content and isinstance(content, str):
+        url_matches = re.findall(r'https?://[^\s<>"\'`]+', content)
         for raw_u in url_matches:
             clean_u = re.sub(r'[.,;:!?)]+$', '', raw_u)
             if not clean_u or clean_u in seen_urls:
@@ -127,9 +187,49 @@ async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, A
             img = await _fetch_image_from_url(clean_u)
             if img:
                 img["source_url"] = clean_u
-                images.append(img)
-                if len(images) >= MAX_IMAGES:
-                    return images
+                current_images.append(img)
+                if len(current_images) >= max_images:
+                    return
+
+
+async def _extract_images_from_message(msg: discord.Message) -> List[Dict[str, Any]]:
+    """Extracts images from message attachments, embeds, direct media URLs, and forwarded message snapshots."""
+    images: List[Dict[str, Any]] = []
+    seen_urls = set()
+
+    # 1. Extract from the direct message
+    await _extract_images_from_source(
+        attachments=getattr(msg, "attachments", None),
+        embeds=getattr(msg, "embeds", None),
+        content=getattr(msg, "content", None),
+        seen_urls=seen_urls,
+        current_images=images,
+        max_images=MAX_IMAGES,
+    )
+
+    # 2. Extract from forwarded message snapshots (Discord Message Forwarding)
+    if len(images) < MAX_IMAGES:
+        snapshots = getattr(msg, "message_snapshots", None) or getattr(msg, "snapshots", None) or []
+        for snapshot in snapshots:
+            if len(images) >= MAX_IMAGES:
+                break
+            snap_attachments = getattr(snapshot, "attachments", None)
+            snap_embeds = getattr(snapshot, "embeds", None)
+            snap_content = getattr(snapshot, "content", None)
+            if isinstance(snapshot, dict):
+                inner_msg = snapshot.get("message", snapshot)
+                snap_attachments = snap_attachments or inner_msg.get("attachments")
+                snap_embeds = snap_embeds or inner_msg.get("embeds")
+                snap_content = snap_content or inner_msg.get("content")
+
+            await _extract_images_from_source(
+                attachments=snap_attachments,
+                embeds=snap_embeds,
+                content=snap_content,
+                seen_urls=seen_urls,
+                current_images=images,
+                max_images=MAX_IMAGES,
+            )
 
     return images
 
@@ -158,6 +258,9 @@ async def should_respond_to_message(bot: Any, message: discord.Message) -> bool:
     # Check for explicit direct user mention (@BotName)
     if bot.user in message.mentions:
         return True
+    if bot.user and hasattr(bot.user, "id") and isinstance(getattr(message, "content", None), str):
+        if f"<@{bot.user.id}>" in message.content or f"<@!{bot.user.id}>" in message.content:
+            return True
 
     # Check for role mentions
     if message.role_mentions:
@@ -345,8 +448,9 @@ class LLMBot(commands.Bot):
             status_msg = None
             try:
                 has_urls = bool(re.search(r'https?://', message.content))
+                has_snapshots = bool(getattr(message, "message_snapshots", None)) or bool(getattr(message, "snapshots", None))
                 # Send early status reply so the user gets instant visual feedback
-                has_possible_images = bool(message.attachments) or bool(message.reference) or has_urls
+                has_possible_images = bool(message.attachments) or bool(message.reference) or has_urls or has_snapshots
                 if has_possible_images:
                     status_msg = await message.reply("🖼️ **Processing image(s)...** Please wait, image analysis can take a moment.", mention_author=False)
                 else:
@@ -360,36 +464,56 @@ class LLMBot(commands.Bot):
 
                 # Check if the message is a reply
                 if message.reference and message.reference.message_id:
-                    try:
-                        referenced_message = await message.channel.fetch_message(message.reference.message_id)
-                        
-                        # Extract images from the referenced message
-                        ref_images = await _extract_images_from_message(referenced_message)
-                        if ref_images:
-                            images.extend(ref_images)
-                            print(f"Extracted {len(ref_images)} image(s) from referenced message by {referenced_message.author.name}")
+                    ref_type = getattr(message.reference, "type", None)
+                    is_forward_ref = (
+                        ref_type == 1
+                        or getattr(ref_type, "value", None) == 1
+                        or str(ref_type).lower().endswith("forward")
+                    )
 
-                        # Check if referenced message was solely an image or media link
-                        ref_urls = [img.get("source_url") for img in ref_images if img.get("source_url")]
-                        clean_ref_content = referenced_message.content.strip() if referenced_message.content else ""
-                        is_only_media_link = clean_ref_content in ref_urls or (
-                            ref_images and clean_ref_content and all(
-                                re.sub(r'[.,;:!?)]+$', '', u) in ref_urls
-                                for u in re.findall(r'https?://[^\s<>"\'`]+', clean_ref_content)
+                    if not is_forward_ref:
+                        try:
+                            referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                            
+                            # Extract images from the referenced message
+                            ref_images = await _extract_images_from_message(referenced_message)
+                            if ref_images:
+                                images.extend(ref_images)
+                                print(f"Extracted {len(ref_images)} image(s) from referenced message by {referenced_message.author.name}")
+
+                            # Check if referenced message was solely an image or media link
+                            ref_urls = [img.get("source_url") for img in ref_images if img.get("source_url")]
+                            clean_ref_content = referenced_message.content.strip() if referenced_message.content else ""
+
+                            # If referenced message is a forwarded message, its caption/text may be inside its snapshots
+                            if not clean_ref_content:
+                                ref_snapshots = getattr(referenced_message, "message_snapshots", None) or getattr(referenced_message, "snapshots", None) or []
+                                ref_texts = []
+                                for s in ref_snapshots:
+                                    c = getattr(s, "content", "") if hasattr(s, "content") else str(s.get("content", ""))
+                                    if c and c.strip():
+                                        ref_texts.append(c.strip())
+                                clean_ref_content = " ".join(ref_texts)
+
+                            ref_found_urls = re.findall(r'https?://[^\s<>"\'`]+', clean_ref_content)
+                            is_only_media_link = clean_ref_content in ref_urls or (
+                                bool(ref_found_urls) and all(
+                                    re.sub(r'[.,;:!?)]+$', '', w) in ref_urls
+                                    for w in clean_ref_content.split()
+                                )
                             )
-                        )
 
-                        if clean_ref_content and not is_only_media_link:
-                            context_str = f"[Context: Replying to a message by {referenced_message.author.name}: \"{clean_ref_content}\"]\n\n"
-                            prompt = context_str + prompt
-                            print(f"Added reply context from {referenced_message.author.name}")
-                        elif ref_images:
-                            context_str = f"[Context: Replying to an image posted by {referenced_message.author.name}]\n\n"
-                            prompt = context_str + prompt
-                    except discord.NotFound:
-                        print("Referenced message not found (it might have been deleted).")
-                    except Exception as e:
-                        print(f"Error fetching referenced message: {e}")
+                            if clean_ref_content and not is_only_media_link:
+                                context_str = f"[Context: Replying to a message by {referenced_message.author.name}: \"{clean_ref_content}\"]\n\n"
+                                prompt = context_str + prompt
+                                print(f"Added reply context from {referenced_message.author.name}")
+                            elif ref_images:
+                                context_str = f"[Context: Replying to an image posted by {referenced_message.author.name}]\n\n"
+                                prompt = context_str + prompt
+                        except discord.NotFound:
+                            print("Referenced message not found (it might have been deleted).")
+                        except Exception as e:
+                            print(f"Error fetching referenced message: {e}")
 
                 # If current message has URLs but no attachments or embeds yet, wait briefly for Discord to unfurl embeds
                 if not message.attachments and not message.embeds and has_urls:
@@ -416,6 +540,21 @@ class LLMBot(commands.Bot):
                     remaining_words = [w for w in words if re.sub(r'[.,;:!?)]+$', '', w) not in extracted_urls]
                     if not remaining_words:
                         prompt = ""
+
+                # If current message is a forwarded message, check if it contains forwarded text caption
+                curr_snapshots = getattr(message, "message_snapshots", None) or getattr(message, "snapshots", None) or []
+                if curr_snapshots:
+                    curr_texts = []
+                    for s in curr_snapshots:
+                        c = getattr(s, "content", "") if hasattr(s, "content") else str(s.get("content", ""))
+                        if c and c.strip():
+                            curr_texts.append(c.strip())
+                    forwarded_caption = " ".join(curr_texts)
+                    if forwarded_caption:
+                        if prompt:
+                            prompt = f"[Forwarded text: \"{forwarded_caption}\"]\n\n{prompt}"
+                        else:
+                            prompt = f"[Forwarded text: \"{forwarded_caption}\"]\n\nDescribe this image and comment on the forwarded message."
 
                 if not prompt and not images:
                     await status_msg.edit(content="You mentioned me, but didn't ask anything or provide an image! How can I help?")
