@@ -201,13 +201,22 @@ class LLMBot(commands.Bot):
 
     def __init__(self):
         """
-        Initializes the bot. The LLM provider is configured via environment variables.
+        Initializes the bot. Operational settings are loaded from settings.json.
         """
+        # Load persistent settings
+        self.settings = self.load_settings()
+
+        members_intent_val = self.settings.get("enable_members_intent", self.settings.get("server_members_intent", os.getenv("ENABLE_MEMBERS_INTENT", False)))
+        if isinstance(members_intent_val, str):
+            self.enable_members_intent = members_intent_val.lower() in ("true", "1", "yes")
+        else:
+            self.enable_members_intent = bool(members_intent_val)
+
         intents = discord.Intents.default()
         intents.messages = True
         intents.message_content = True
         intents.guilds = True
-        if os.getenv("ENABLE_MEMBERS_INTENT", "false").lower() == "true":
+        if self.enable_members_intent:
             intents.members = True
         # The prefix is required but won't be used for slash commands.
         super().__init__(command_prefix="!", intents=intents)
@@ -215,8 +224,6 @@ class LLMBot(commands.Bot):
         self.prompts = self.load_prompts()
         self.banned_words = self.load_banned_words() # Load banned words
         
-        # Load persistent settings
-        self.settings = self.load_settings()
         self.system_prompt = self.settings.get("system_prompt", self.prompts.get("default", "You are a helpful assistant."))
         self.prompt_name = self.settings.get("prompt_name") or self.get_prompt_name(self.system_prompt)
         self.random_mode = self.settings.get("random_mode", False)
@@ -224,8 +231,8 @@ class LLMBot(commands.Bot):
         self.grounding_enabled = self.settings.get("grounding_enabled", False)
         self.llm_provider = self.settings.get("llm_provider", os.getenv("LLM_PROVIDER", "LMSTUDIO")).upper()
         self.gemini_model = self.settings.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
-        self.gemini_fallback_model = self.settings.get("gemini_fallback_model", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite"))
-        self.gemini_timeout = float(self.settings.get("gemini_timeout", os.getenv("GEMINI_TIMEOUT", 30.0)))
+        self.gemini_fallback_model = self.settings.get("gemini_fallback_model", self.settings.get("fallback_model", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")))
+        self.gemini_timeout = float(self.settings.get("gemini_timeout", self.settings.get("timeout", os.getenv("GEMINI_TIMEOUT", 30.0))))
         self.run_in_background = self.settings.get("run_in_background", os.getenv("RUN_IN_BACKGROUND", "false").lower() == "true")
         self.max_history = int(self.settings.get("max_history", os.getenv("MAX_HISTORY", 15)))
         self.temperature = float(self.settings.get("temperature", 0.7))
@@ -234,7 +241,7 @@ class LLMBot(commands.Bot):
         self.last_response_info = None # Information about the last response generated
         
         self.message_history = {}
-        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Fallback: {self.gemini_fallback_model}, Timeout: {self.gemini_timeout}s, Temp: {self.temperature}, Prompt: {self.prompt_name}). Connecting to Discord...")
+        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Fallback: {self.gemini_fallback_model}, Timeout: {self.gemini_timeout}s, Temp: {self.temperature}, Prompt: {self.prompt_name}, Members Intent: {self.enable_members_intent}). Connecting to Discord...")
 
     def get_prompt_name(self, prompt_text: str) -> str:
         """Returns the preset name matching prompt_text, or 'custom' if none match."""
@@ -300,6 +307,7 @@ class LLMBot(commands.Bot):
             "gemini_model": self.gemini_model,
             "gemini_fallback_model": self.gemini_fallback_model,
             "gemini_timeout": self.gemini_timeout,
+            "enable_members_intent": self.enable_members_intent,
             "run_in_background": self.run_in_background,
             "max_history": self.max_history,
             "temperature": self.temperature

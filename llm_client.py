@@ -52,6 +52,8 @@ def _get_default_fallback_model(provider: str) -> Optional[str]:
             data = json.load(f)
             if "gemini_fallback_model" in data and data["gemini_fallback_model"]:
                 return data["gemini_fallback_model"]
+            if "fallback_model" in data and data["fallback_model"]:
+                return data["fallback_model"]
     except Exception:
         pass
     return os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
@@ -66,6 +68,8 @@ def _get_default_timeout(provider: str) -> Optional[float]:
             data = json.load(f)
             if "gemini_timeout" in data and data["gemini_timeout"] is not None:
                 return float(data["gemini_timeout"])
+            if "timeout" in data and data["timeout"] is not None:
+                return float(data["timeout"])
     except Exception:
         pass
     try:
