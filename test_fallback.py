@@ -390,5 +390,66 @@ class TestMessageTriggerCriteria(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleaned, "Tell me a joke")
 
 
+class TestSettingsAndIntents(unittest.TestCase):
+
+    def test_bot_loads_fallback_and_members_intent_from_settings(self):
+        """Verify bot reads fallback model, timeout, and members intent from settings."""
+        from bot import LLMBot
+        test_settings = {
+            "gemini_fallback_model": "custom-fallback-model",
+            "gemini_timeout": 45.0,
+            "enable_members_intent": True,
+            "llm_provider": "GEMINI",
+            "gemini_model": "gemini-2.5-flash"
+        }
+        with patch.object(LLMBot, "load_settings", return_value=test_settings):
+            with patch.object(LLMBot, "load_prompts", return_value={"default": "assistant"}):
+                with patch.object(LLMBot, "load_banned_words", return_value=[]):
+                    bot = LLMBot()
+                    self.assertEqual(bot.gemini_fallback_model, "custom-fallback-model")
+                    self.assertEqual(bot.gemini_timeout, 45.0)
+                    self.assertTrue(bot.enable_members_intent)
+                    self.assertTrue(bot.intents.members)
+
+    def test_bot_members_intent_disabled_by_default(self):
+        """Verify members intent is False when configured as False in settings."""
+        from bot import LLMBot
+        test_settings = {
+            "gemini_fallback_model": "gemini-2.5-flash-lite",
+            "gemini_timeout": 30.0,
+            "enable_members_intent": False
+        }
+        with patch.object(LLMBot, "load_settings", return_value=test_settings):
+            with patch.object(LLMBot, "load_prompts", return_value={"default": "assistant"}):
+                with patch.object(LLMBot, "load_banned_words", return_value=[]):
+                    bot = LLMBot()
+                    self.assertFalse(bot.enable_members_intent)
+                    self.assertFalse(bot.intents.members)
+
+    def test_save_settings_persists_fallback_and_members_intent(self):
+        """Verify save_settings includes fallback model, timeout, and members intent."""
+        from bot import LLMBot
+        test_settings = {
+            "gemini_fallback_model": "gemini-test-fallback",
+            "gemini_timeout": 20.0,
+            "enable_members_intent": True
+        }
+        saved_data = {}
+        def mock_dump(obj, f, **kwargs):
+            saved_data.update(obj)
+
+        with patch.object(LLMBot, "load_settings", return_value=test_settings):
+            with patch.object(LLMBot, "load_prompts", return_value={"default": "assistant"}):
+                with patch.object(LLMBot, "load_banned_words", return_value=[]):
+                    bot = LLMBot()
+                    with patch("builtins.open", MagicMock()):
+                        with patch("json.dump", side_effect=mock_dump):
+                            bot.save_settings()
+                            self.assertEqual(saved_data.get("gemini_fallback_model"), "gemini-test-fallback")
+                            self.assertEqual(saved_data.get("gemini_timeout"), 20.0)
+                            self.assertEqual(saved_data.get("enable_members_intent"), True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
