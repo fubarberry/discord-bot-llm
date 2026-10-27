@@ -390,7 +390,7 @@ class TestMessageTriggerCriteria(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleaned, "Tell me a joke")
 
 
-class TestSettingsAndIntents(unittest.TestCase):
+class TestSettingsAndIntents(unittest.IsolatedAsyncioTestCase):
 
     def test_bot_loads_fallback_and_members_intent_from_settings(self):
         """Verify bot reads fallback model, timeout, and members intent from settings."""
@@ -448,6 +448,115 @@ class TestSettingsAndIntents(unittest.TestCase):
                             self.assertEqual(saved_data.get("gemini_fallback_model"), "gemini-test-fallback")
                             self.assertEqual(saved_data.get("gemini_timeout"), 20.0)
                             self.assertEqual(saved_data.get("enable_members_intent"), True)
+
+    async def test_gemini_separate_primary_and_fallback_timeouts(self):
+        """Verify primary model uses short timeout and fallback model uses longer fallback_timeout."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}):
+            with patch("llm_client_gemini.genai.Client"):
+                calls = []
+
+                async def mock_execute(client, model_name, prompt, system_prompt, history, images, temperature, timeout):
+                    calls.append((model_name, timeout))
+                    if model_name == "gemini-3.5-flash-lite":
+                        raise asyncio.TimeoutError()
+                    return f"Fallback response from {model_name}"
+
+                with patch("llm_client_gemini._execute_gemini_request", side_effect=mock_execute):
+                    metadata = {}
+                    res = await llm_client_gemini.get_llm_response(
+                        prompt="Test prompt",
+                        system_prompt="Test system",
+                        model_name="gemini-3.5-flash-lite",
+                        fallback_model="gemini-2.5-flash-lite",
+                        timeout=3.0,
+                        fallback_timeout=45.0,
+                        metadata=metadata
+                    )
+
+                    self.assertEqual(res, "Fallback response from gemini-2.5-flash-lite")
+                    self.assertTrue(metadata.get("fallback_used"))
+                    self.assertEqual(calls, [
+                        ("gemini-3.5-flash-lite", 3.0),
+                        ("gemini-2.5-flash-lite", 45.0)
+                    ])
+
+    async def test_grounding_stays_on_fallback_after_primary_timeout(self):
+        """Verify that after primary times out in step 1, subsequent grounding steps only use fallback."""
+        models_called = []
+        timeouts_used = []
+
+        async def mock_execute(client, model_name, prompt, system_prompt, history, images, temperature, timeout):
+            models_called.append(model_name)
+            timeouts_used.append(timeout)
+            if model_name == "gemini-3.5-flash-lite":
+                raise asyncio.TimeoutError()
+            # If step 1 (decision router): decide NO_SEARCH
+            if "NO_SEARCH" in system_prompt:
+                return "NO_SEARCH"
+            return "Final synthesized answer"
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}):
+            with patch("llm_client_gemini.genai.Client"), \
+                 patch("llm_client_gemini._execute_gemini_request", side_effect=mock_execute):
+
+                metadata = {}
+                res = await llm_client.get_llm_response(
+                    prompt="What is Python?",
+                    system_prompt="You are an assistant.",
+                    provider="GEMINI",
+                    model="gemini-3.5-flash-lite",
+                    fallback_model="gemini-2.5-flash-lite",
+                    timeout=2.0,
+                    fallback_timeout=35.0,
+                    grounding=True,
+                    metadata=metadata
+                )
+
+                self.assertEqual(res, "Final synthesized answer")
+                self.assertTrue(metadata.get("fallback_used"))
+                # Step 1: primary timed out at 2.0s -> fallback succeeded at 35.0s
+                # Step 2: generation step called fallback DIRECTLY at 35.0s without touching primary!
+                self.assertEqual(models_called, [
+                    "gemini-3.5-flash-lite",  # Step 1: primary (timed out)
+                    "gemini-2.5-flash-lite",  # Step 1: fallback switch
+                    "gemini-2.5-flash-lite"   # Step 2: subsequent generation step directly on fallback
+                ])
+                self.assertEqual(timeouts_used, [2.0, 35.0, 35.0])
+
+    async def test_timeout_and_fallbacktimeout_slash_commands(self):
+        """Verify /timeout and /fallbacktimeout commands update timeouts and persist to settings."""
+        from bot import LLMBot, timeout_command, fallback_timeout_command
+
+        test_settings = {
+            "gemini_timeout": 5.0,
+            "gemini_fallback_timeout": 30.0
+        }
+        with patch.object(LLMBot, "load_settings", return_value=test_settings), \
+             patch.object(LLMBot, "load_prompts", return_value={"default": "assistant"}), \
+             patch.object(LLMBot, "load_banned_words", return_value=[]):
+            bot = LLMBot()
+            saved_data = {}
+
+            def mock_dump(obj, f, **kwargs):
+                saved_data.update(obj)
+
+            with patch("builtins.open", MagicMock()), patch("json.dump", side_effect=mock_dump):
+                interaction = MagicMock()
+                interaction.client = bot
+                interaction.guild = None
+                interaction.response.send_message = AsyncMock()
+
+                # Test /timeout 3.0 40.0
+                await timeout_command.callback(interaction, 3.0, 40.0)
+                self.assertEqual(bot.gemini_timeout, 3.0)
+                self.assertEqual(bot.gemini_fallback_timeout, 40.0)
+                self.assertEqual(saved_data.get("gemini_timeout"), 3.0)
+                self.assertEqual(saved_data.get("gemini_fallback_timeout"), 40.0)
+
+                # Test /fallbacktimeout 55.0
+                await fallback_timeout_command.callback(interaction, 55.0)
+                self.assertEqual(bot.gemini_fallback_timeout, 55.0)
+                self.assertEqual(saved_data.get("gemini_fallback_timeout"), 55.0)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,23 @@ def _get_default_timeout() -> float:
         return 30.0
 
 
+def _get_default_fallback_timeout() -> float:
+    """Reads gemini_fallback_timeout from settings.json or falls back to env/default (in seconds)."""
+    try:
+        with open("settings.json", "r") as f:
+            data = json.load(f)
+            if "gemini_fallback_timeout" in data and data["gemini_fallback_timeout"] is not None:
+                return float(data["gemini_fallback_timeout"])
+            if "fallback_timeout" in data and data["fallback_timeout"] is not None:
+                return float(data["fallback_timeout"])
+    except Exception:
+        pass
+    try:
+        return float(os.getenv("GEMINI_FALLBACK_TIMEOUT", 30.0))
+    except ValueError:
+        return 30.0
+
+
 def _is_transient_or_overload_error(error: Exception) -> bool:
     """Checks if an error represents an overload, rate limit, timeout, or transient server issue."""
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
@@ -104,18 +121,22 @@ def _format_fallback_failure(
     primary_err: Exception,
     fallback_model: str,
     fallback_err: Exception,
-    timeout: Optional[float] = None
+    timeout: Optional[float] = None,
+    fallback_timeout: Optional[float] = None
 ) -> str:
     """Formats an error message when both primary and fallback models fail."""
     primary_is_to = isinstance(primary_err, (asyncio.TimeoutError, TimeoutError))
     fallback_is_to = isinstance(fallback_err, (asyncio.TimeoutError, TimeoutError))
 
     to_str = f" after {timeout}s" if timeout else ""
+    fb_to_str = f" after {fallback_timeout}s" if fallback_timeout else to_str
     primary_desc = f"timed out{to_str}" if primary_is_to else "overloaded / unavailable"
-    fallback_desc = f"timed out{to_str}" if fallback_is_to else f"failed: {fallback_err}"
+    fallback_desc = f"timed out{fb_to_str}" if fallback_is_to else f"failed: {fallback_err}"
 
     if primary_is_to and fallback_is_to:
-        return f"⚠️ **Gemini API Error (Timeout)**: Primary model `{primary_model}` and fallback model `{fallback_model}` both timed out{to_str}."
+        if timeout == fallback_timeout or not fallback_timeout:
+            return f"⚠️ **Gemini API Error (Timeout)**: Primary model `{primary_model}` and fallback model `{fallback_model}` both timed out{to_str}."
+        return f"⚠️ **Gemini API Error (Timeout)**: Primary model `{primary_model}` timed out{to_str} and fallback model `{fallback_model}` timed out{fb_to_str}."
 
     return (
         f"⚠️ **Gemini API Error (Overloaded)**: Primary model `{primary_model}` was {primary_desc}, "
@@ -218,6 +239,7 @@ async def get_llm_response(
     temperature: Optional[float] = None,
     fallback_model: Optional[str] = None,
     timeout: Optional[float] = None,
+    fallback_timeout: Optional[float] = None,
     metadata: Optional[Dict[str, Any]] = None,
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None
 ) -> Optional[str]:
@@ -234,7 +256,8 @@ async def get_llm_response(
         images (Optional[List[Dict[str, Any]]]): Optional list of image dicts with 'data' and 'mime_type'.
         temperature (Optional[float]): Model temperature (defaults to 0.7).
         fallback_model (Optional[str]): Gemini model to fall back to if primary model is overloaded/times out.
-        timeout (Optional[float]): Timeout in seconds for the request.
+        timeout (Optional[float]): Timeout in seconds for the primary model request.
+        fallback_timeout (Optional[float]): Timeout in seconds for the fallback model request.
         metadata (Optional[Dict[str, Any]]): Dict to record execution details (model used, fallback_used, etc.).
         status_callback (Optional[Callable]): Async callback for progress notifications.
 
@@ -252,6 +275,36 @@ async def get_llm_response(
     active_model = model_name or _get_default_model()
     active_fallback = fallback_model or _get_default_fallback_model()
     active_timeout = timeout if timeout is not None else _get_default_timeout()
+    active_fallback_timeout = fallback_timeout if fallback_timeout is not None else _get_default_fallback_timeout()
+
+    # Check if a previous step in this response interaction already switched to fallback.
+    # If so, do NOT attempt the primary model again; use the fallback model directly with fallback_timeout.
+    already_fallen_back = bool(metadata and metadata.get("fallback_used"))
+
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as e:
+        print(f"Error initializing Gemini client: {e}")
+        return f"⚠️ **Gemini Client Error**: {e}"
+
+    if already_fallen_back and active_fallback:
+        target_model = metadata.get("fallback_model") or metadata.get("model") or active_fallback
+        print(f"Subsequent request step: Using fallback model '{target_model}' directly (Timeout: {active_fallback_timeout}s).")
+        try:
+            res = await _execute_gemini_request(
+                client=client,
+                model_name=target_model,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                history=history,
+                images=images,
+                temperature=temperature,
+                timeout=active_fallback_timeout
+            )
+            return res
+        except Exception as fallback_exc:
+            print(f"Gemini fallback model '{target_model}' failed on subsequent step: {fallback_exc}")
+            return _format_gemini_error(fallback_exc, target_model, active_fallback_timeout)
 
     if metadata is not None:
         metadata["provider"] = "GEMINI"
@@ -261,12 +314,6 @@ async def get_llm_response(
         metadata["fallback_used"] = False
         if temperature is not None:
             metadata["temperature"] = temperature
-
-    try:
-        client = genai.Client(api_key=api_key)
-    except Exception as e:
-        print(f"Error initializing Gemini client: {e}")
-        return f"⚠️ **Gemini Client Error**: {e}"
 
     try:
         res = await _execute_gemini_request(
@@ -293,7 +340,7 @@ async def get_llm_response(
         if can_fallback:
             is_timeout = isinstance(primary_exc, (asyncio.TimeoutError, TimeoutError))
             reason = f"timed out after {active_timeout}s" if is_timeout else "overloaded / unavailable"
-            print(f"Primary model '{active_model}' was {reason}. Attempting fallback to '{active_fallback}'...")
+            print(f"Primary model '{active_model}' was {reason}. Attempting fallback to '{active_fallback}' (Timeout: {active_fallback_timeout}s)...")
 
             if status_callback:
                 try:
@@ -310,7 +357,7 @@ async def get_llm_response(
                     history=history,
                     images=images,
                     temperature=temperature,
-                    timeout=active_timeout
+                    timeout=active_fallback_timeout
                 )
 
                 if metadata is not None:
@@ -328,7 +375,8 @@ async def get_llm_response(
                     primary_err=primary_exc,
                     fallback_model=active_fallback,
                     fallback_err=fallback_exc,
-                    timeout=active_timeout
+                    timeout=active_timeout,
+                    fallback_timeout=active_fallback_timeout
                 )
 
         return _format_gemini_error(primary_exc, active_model, active_timeout)

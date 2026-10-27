@@ -78,6 +78,25 @@ def _get_default_timeout(provider: str) -> Optional[float]:
         return 30.0
 
 
+def _get_default_fallback_timeout(provider: str) -> Optional[float]:
+    """Reads default fallback timeout from settings.json or falls back to env."""
+    if provider != "GEMINI":
+        return None
+    try:
+        with open("settings.json", "r") as f:
+            data = json.load(f)
+            if "gemini_fallback_timeout" in data and data["gemini_fallback_timeout"] is not None:
+                return float(data["gemini_fallback_timeout"])
+            if "fallback_timeout" in data and data["fallback_timeout"] is not None:
+                return float(data["fallback_timeout"])
+    except Exception:
+        pass
+    try:
+        return float(os.getenv("GEMINI_FALLBACK_TIMEOUT", 30.0))
+    except ValueError:
+        return 30.0
+
+
 async def query_llm(
     prompt: str,
     system_prompt: str,
@@ -90,6 +109,7 @@ async def query_llm(
     temperature: Optional[float] = None,
     fallback_model: Optional[str] = None,
     timeout: Optional[float] = None,
+    fallback_timeout: Optional[float] = None,
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None
 ) -> Optional[str]:
     """
@@ -110,7 +130,8 @@ async def query_llm(
     if active_provider == "GEMINI":
         active_fallback = fallback_model or _get_default_fallback_model(active_provider)
         active_timeout = timeout if timeout is not None else _get_default_timeout(active_provider)
-        print(f"Using Gemini API as the LLM provider (Model: {active_model}, Fallback: {active_fallback}, Temp: {active_temperature}, Timeout: {active_timeout}s).")
+        active_fallback_timeout = fallback_timeout if fallback_timeout is not None else _get_default_fallback_timeout(active_provider)
+        print(f"Using Gemini API as the LLM provider (Model: {active_model}, Fallback: {active_fallback}, Temp: {active_temperature}, Timeout: {active_timeout}s, Fallback Timeout: {active_fallback_timeout}s).")
         return await get_gemini_response(
             prompt,
             system_prompt,
@@ -120,6 +141,7 @@ async def query_llm(
             temperature=active_temperature,
             fallback_model=active_fallback,
             timeout=active_timeout,
+            fallback_timeout=active_fallback_timeout,
             metadata=metadata,
             status_callback=status_callback
         )
@@ -144,7 +166,8 @@ async def get_llm_response(
     metadata: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
     fallback_model: Optional[str] = None,
-    timeout: Optional[float] = None
+    timeout: Optional[float] = None,
+    fallback_timeout: Optional[float] = None
 ) -> Optional[str]:
     """
     Gets a response from the configured LLM provider, optionally using web search grounding.
@@ -162,7 +185,8 @@ async def get_llm_response(
         metadata (Optional[Dict[str, Any]]): Optional dictionary to capture execution metadata (provider, model, grounding_used, temperature).
         temperature (Optional[float]): Optional override for model temperature (e.g. 0.7).
         fallback_model (Optional[str]): Optional fallback model name for Gemini.
-        timeout (Optional[float]): Optional request timeout in seconds for Gemini.
+        timeout (Optional[float]): Optional request timeout in seconds for primary Gemini model.
+        fallback_timeout (Optional[float]): Optional request timeout in seconds for fallback Gemini model.
 
     Returns:
         Optional[str]: Generated response string or error message.
@@ -181,6 +205,8 @@ async def get_llm_response(
         metadata["grounding_used"] = False
         metadata["temperature"] = active_temperature
 
+    session_metadata = metadata if metadata is not None else {}
+
     if grounding:
         async def _query_helper(
             p: str,
@@ -188,16 +214,31 @@ async def get_llm_response(
             h: Optional[List[Dict[str, str]]],
             imgs: Optional[List[Dict[str, Any]]] = None
         ) -> Optional[str]:
+            step_model = model
+            step_fallback = fallback_model
+            step_timeout = timeout
+            step_fallback_timeout = fallback_timeout
+
+            # If a prior step during this response already triggered fallback,
+            # bypass the primary model and directly use the fallback model with fallback timeout
+            if session_metadata.get("fallback_used"):
+                step_model = session_metadata.get("fallback_model") or fallback_model or model
+                step_fallback = None
+                active_fb_to = fallback_timeout if fallback_timeout is not None else _get_default_fallback_timeout(active_provider)
+                if active_fb_to is not None:
+                    step_timeout = active_fb_to
+
             return await query_llm(
                 p, s, h if h is not None else [],
                 thinking_enabled=thinking_enabled,
                 provider=provider,
-                model=model,
+                model=step_model,
                 images=imgs,
-                metadata=metadata,
+                metadata=session_metadata,
                 temperature=active_temperature,
-                fallback_model=fallback_model,
-                timeout=timeout,
+                fallback_model=step_fallback,
+                timeout=step_timeout,
+                fallback_timeout=step_fallback_timeout,
                 status_callback=status_callback
             )
 
@@ -208,7 +249,7 @@ async def get_llm_response(
             query_llm_fn=_query_helper,
             status_callback=status_callback,
             images=images,
-            metadata=metadata
+            metadata=session_metadata
         )
 
     return await query_llm(
@@ -223,5 +264,6 @@ async def get_llm_response(
         temperature=active_temperature,
         fallback_model=fallback_model,
         timeout=timeout,
+        fallback_timeout=fallback_timeout,
         status_callback=status_callback
     )

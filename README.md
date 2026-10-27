@@ -139,13 +139,15 @@ Interact with the bot in your Discord server using these slash commands:
 
 -   `/help`: Shows a list of all available commands.
 -   `/listprompts`: Lists all the available preset personalities (system prompts) from the `prompts.json` file.
+-   `/reloadprompts`: Hot-reloads all system prompts and profile pictures from `prompts.json` without needing to restart the bot.
 -   `/info`: Shows details about the last response generated (LLM provider, model, temperature, grounding status, whether grounding was used, system prompt, random mode, and image processing).
 -   `/temp <0.0 - 2.0>`: Sets the model temperature (Admin only). Default is `0.7`.
 -   `/setprompt <name>`: Changes the bot's personality. Start typing a name, and it will autocomplete with available presets. You can also type your own custom prompt directly.
 -   `/provider <LM Studio|Gemini>`: Switches the active LLM provider (Admin only). Also available as `/source`.
 -   `/model <name>`: Changes the active model name (Admin only, with preset autocomplete for Gemini models).
 -   `/fallbackmodel <name>`: Changes the Gemini fallback model (Admin only, defaults to `gemini-2.5-flash-lite`).
--   `/timeout <seconds>`: Sets the Gemini request timeout in seconds (Admin only, defaults to `30.0`).
+-   `/timeout <seconds> [fallback_seconds]`: Sets the Gemini primary model timeout (e.g. `5.0` for fast fallback) and optional secondary fallback timeout (Admin only).
+-   `/fallbacktimeout <seconds>`: Sets the Gemini fallback model timeout in seconds (Admin only, defaults to `30.0`).
 -   `/random <True|False>`: Toggles using a random prompt for each reply.
 -   `/think <True|False>`: Toggles whether the bot shows its thought process (LM Studio only).
 -   `/grounding <True|False>`: Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader). Also available as `/websearch`.
@@ -154,3 +156,36 @@ Interact with the bot in your Discord server using these slash commands:
     - **Reply to an image**: Reply to any message in the channel containing an image or screenshot, mention the bot, and ask your question (e.g., `@YourBotName is this true?` or `@YourBotName what is this?`).
     - **Direct image upload**: Attach an image directly to your message and mention the bot.
     - Works with Google Gemini (free API) and LM Studio (when a vision model such as `Qwen2-VL` or `Llama-3.2-Vision` is loaded).
+
+## Dynamic System Prompts & Profile Pictures (Webhooks)
+
+Each personality defined in `prompts.json` can have its own dedicated profile picture and display name. When responding in a Discord channel or thread, the bot uses Discord webhooks to post the response with the personality's custom profile picture and username.
+
+### Configuring `prompts.json`
+
+You can define prompts using either the object structure with custom avatars or the legacy plain string format:
+
+```json
+{
+  "pirate": {
+    "prompt": "You are a swashbuckling pirate captain. Answer all questions in a hearty pirate manner, arrr!",
+    "avatar_url": "https://example.com/pirate.png",
+    "username": "Cap'n Jack"
+  },
+  "tsundere": {
+    "prompt": "You are a tsundere highschool girl...",
+    "pfp": "https://example.com/tsundere.png"
+  },
+  "classic": "You are a standard helpful assistant."
+}
+```
+
+- **`prompt`** (or `text`, `system_prompt`): The system prompt text sent to the LLM.
+- **`avatar_url`** (or `pfp`, `avatar`, `profile_pic`): A public image URL (`http://` or `https://`) for the personality's profile picture. If omitted or empty, the bot's default avatar is used.
+- **`username`** (or `name`, optional): The display name used when sending messages. If omitted, the bot's current name is used.
+
+### Permissions & Fallback Behavior
+
+- **Permissions**: Make sure the bot has the **Manage Webhooks** permission in your Discord server/channel.
+- **Automatic Fallback**: If the bot lacks webhook permissions, if Discord rejects an avatar URL, or if interacting via DMs (where webhooks are unsupported by Discord), the bot automatically falls back to standard message sending.
+- **Hot-Reloading**: Use `/reloadprompts` after editing `prompts.json` to load updated prompts or profile pictures immediately without restarting the bot.

@@ -5,7 +5,8 @@ from discord import app_commands
 from discord.ext import commands
 from llm_client import get_llm_response
 import json
-from typing import List, Dict, Optional, Any
+import inspect
+from typing import List, Dict, Optional, Any, Tuple, Set
 import random
 import re
 import os
@@ -241,15 +242,21 @@ async def should_respond_to_message(bot: Any, message: discord.Message) -> bool:
     Determines whether the bot should respond to an incoming message.
 
     Rules:
-    - Never respond to messages sent by the bot itself.
+    - Never respond to messages sent by the bot itself or its webhooks.
     - Ignore @everyone and @here pings (unless the bot is explicitly mentioned directly).
     - Respond to direct user mentions (@BotName).
     - Respond to direct messages (DMs).
+    - Respond when replying to a message sent by the bot or one of the bot's webhooks.
     - Respond to role pings (@RoleName) if the role is assigned to the bot
       and the role has less than 5 members.
     """
     if message.author == bot.user:
         return False
+
+    # Never respond to messages sent by the bot's own webhooks
+    if getattr(message, "webhook_id", None):
+        if hasattr(bot, "is_bot_webhook_id") and await bot.is_bot_webhook_id(message.webhook_id, message.channel):
+            return False
 
     # In direct messages (DMs), always respond
     if message.guild is None:
@@ -261,6 +268,34 @@ async def should_respond_to_message(bot: Any, message: discord.Message) -> bool:
     if bot.user and hasattr(bot.user, "id") and isinstance(getattr(message, "content", None), str):
         if f"<@{bot.user.id}>" in message.content or f"<@!{bot.user.id}>" in message.content:
             return True
+
+    # Check if this message is a reply to a message sent by the bot or the bot's webhooks
+    if message.reference and getattr(message.reference, "message_id", None):
+        ref_type = getattr(message.reference, "type", None)
+        is_forward_ref = (
+            ref_type == 1
+            or getattr(ref_type, "value", None) == 1
+            or str(ref_type).lower().endswith("forward")
+        )
+        if not is_forward_ref:
+            ref_msg = getattr(message.reference, "resolved", None)
+            if not isinstance(ref_msg, discord.Message):
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                except Exception:
+                    ref_msg = None
+
+            if ref_msg:
+                # 1. Did the bot send the referenced message directly?
+                if (bot.user and ref_msg.author == bot.user) or (bot.user and getattr(ref_msg.author, "id", None) == bot.user.id):
+                    print(f"Triggered by direct reply to bot's message ({ref_msg.id}) by {getattr(message.author, 'name', 'user')} in #{message.channel}")
+                    return True
+
+                # 2. Was the referenced message sent by one of our bot's webhooks?
+                if getattr(ref_msg, "webhook_id", None):
+                    if hasattr(bot, "is_bot_webhook_id") and await bot.is_bot_webhook_id(ref_msg.webhook_id, message.channel):
+                        print(f"Triggered by reply to bot webhook message ({ref_msg.id}, webhook {ref_msg.webhook_id}) by {getattr(message.author, 'name', 'user')} in #{message.channel}")
+                        return True
 
     # Check for role mentions
     if message.role_mentions:
@@ -324,7 +359,15 @@ class LLMBot(commands.Bot):
         # The prefix is required but won't be used for slash commands.
         super().__init__(command_prefix="!", intents=intents)
 
-        self.prompts = self.load_prompts()
+        self._webhook_cache: Dict[int, discord.Webhook] = {}
+        self._persona_webhook_cache: Dict[Tuple[int, str], discord.Webhook] = {}
+        self._local_avatar_cdn_cache: Dict[str, str] = {}
+        self._known_webhook_ids: Set[int] = set()
+        self.raw_prompts: Dict[str, Any] = {}
+        self.prompts: Dict[str, str] = {}
+        self.prompt_profiles: Dict[str, Dict[str, Optional[str]]] = {}
+        self.reload_prompts()
+
         self.banned_words = self.load_banned_words() # Load banned words
         
         self.system_prompt = self.settings.get("system_prompt", self.prompts.get("default", "You are a helpful assistant."))
@@ -335,7 +378,8 @@ class LLMBot(commands.Bot):
         self.llm_provider = self.settings.get("llm_provider", os.getenv("LLM_PROVIDER", "LMSTUDIO")).upper()
         self.gemini_model = self.settings.get("gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
         self.gemini_fallback_model = self.settings.get("gemini_fallback_model", self.settings.get("fallback_model", os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")))
-        self.gemini_timeout = float(self.settings.get("gemini_timeout", self.settings.get("timeout", os.getenv("GEMINI_TIMEOUT", 30.0))))
+        self.gemini_timeout = float(self.settings.get("gemini_timeout", self.settings.get("timeout", os.getenv("GEMINI_TIMEOUT", 5.0))))
+        self.gemini_fallback_timeout = float(self.settings.get("gemini_fallback_timeout", self.settings.get("fallback_timeout", os.getenv("GEMINI_FALLBACK_TIMEOUT", 30.0))))
         self.run_in_background = self.settings.get("run_in_background", os.getenv("RUN_IN_BACKGROUND", "false").lower() == "true")
         self.max_history = int(self.settings.get("max_history", os.getenv("MAX_HISTORY", 15)))
         self.temperature = float(self.settings.get("temperature", 0.7))
@@ -344,7 +388,37 @@ class LLMBot(commands.Bot):
         self.last_response_info = None # Information about the last response generated
         
         self.message_history = {}
-        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Fallback: {self.gemini_fallback_model}, Timeout: {self.gemini_timeout}s, Temp: {self.temperature}, Prompt: {self.prompt_name}, Members Intent: {self.enable_members_intent}). Connecting to Discord...")
+        print(f"Bot initialized (Provider: {self.llm_provider}, Model: {self.gemini_model}, Fallback: {self.gemini_fallback_model}, Timeout: {self.gemini_timeout}s, Fallback Timeout: {self.gemini_fallback_timeout}s, Temp: {self.temperature}, Prompt: {self.prompt_name}, Members Intent: {self.enable_members_intent}). Connecting to Discord...")
+
+    def reload_prompts(self):
+        """Loads and parses system prompts and profile pictures from prompts.json."""
+        raw = self.load_prompts()
+        self.raw_prompts = raw if isinstance(raw, dict) else {}
+        prompts = {}
+        profiles = {}
+        for name, value in self.raw_prompts.items():
+            if isinstance(value, dict):
+                prompt_text = value.get("prompt") or value.get("text") or value.get("system_prompt") or ""
+                avatar_url = value.get("avatar_url") or value.get("pfp") or value.get("avatar") or value.get("profile_pic")
+                username = value.get("username") or value.get("name") or value.get("display_name")
+            else:
+                prompt_text = str(value) if value is not None else ""
+                avatar_url = None
+                username = None
+
+            prompts[name] = prompt_text
+            profiles[name] = {
+                "avatar_url": str(avatar_url).strip() if avatar_url and str(avatar_url).strip() else None,
+                "username": str(username).strip() if username and str(username).strip() else None
+            }
+        self.prompts = prompts
+        self.prompt_profiles = profiles
+
+    def get_prompt_profile(self, prompt_name: Optional[str]) -> Dict[str, Optional[str]]:
+        """Returns the profile info (avatar_url, username) for a given prompt name."""
+        if prompt_name and prompt_name in self.prompt_profiles:
+            return self.prompt_profiles[prompt_name]
+        return {"avatar_url": None, "username": None}
 
     def get_prompt_name(self, prompt_text: str) -> str:
         """Returns the preset name matching prompt_text, or 'custom' if none match."""
@@ -366,6 +440,297 @@ class LLMBot(commands.Bot):
         except json.JSONDecodeError:
             print("Error: Could not decode prompts.json. Please check its format.")
             return {"default": "You are a helpful assistant."}
+
+    async def get_webhook_for_channel(
+        self,
+        channel: discord.abc.Messageable,
+        prompt_name: Optional[str] = None,
+        avatar_bytes: Optional[bytes] = None
+    ) -> Optional[Tuple[discord.Webhook, Optional[discord.Thread]]]:
+        """Fetches or creates a webhook for sending messages in a given channel or thread."""
+        thread = None
+        target_channel = channel
+
+        if isinstance(channel, discord.Thread):
+            thread = channel
+            target_channel = channel.parent
+            if target_channel is None and hasattr(channel, "guild") and channel.guild:
+                try:
+                    target_channel = await channel.guild.fetch_channel(channel.parent_id)
+                except Exception as e:
+                    print(f"Could not fetch parent channel for thread {channel.name}: {e}")
+                    return None
+
+        # Check if channel supports webhooks
+        if not hasattr(target_channel, "create_webhook") or not hasattr(target_channel, "webhooks"):
+            return None
+
+        # Check permissions if available
+        if hasattr(target_channel, "guild") and target_channel.guild:
+            guild = target_channel.guild
+            me = getattr(guild, "me", None)
+            if me is None and self.user:
+                try:
+                    me = guild.get_member(self.user.id)
+                except Exception:
+                    pass
+            if me and hasattr(target_channel, "permissions_for"):
+                try:
+                    perms = target_channel.permissions_for(me)
+                    if not getattr(perms, "manage_webhooks", True):
+                        print(f"Bot lacks 'Manage Webhooks' permission in #{getattr(target_channel, 'name', target_channel.id)}.")
+                        return None
+                except Exception:
+                    pass
+
+        # If a specific persona with avatar_bytes is requested, check persona cache
+        cache_key = (target_channel.id, prompt_name) if prompt_name and avatar_bytes else None
+        if cache_key and cache_key in self._persona_webhook_cache:
+            return self._persona_webhook_cache[cache_key], thread
+
+        # Check general webhook cache if not a persona-specific request
+        if not cache_key and target_channel.id in self._webhook_cache:
+            return self._webhook_cache[target_channel.id], thread
+
+        # Fetch existing webhooks
+        existing_webhooks = []
+        try:
+            wh_call = getattr(target_channel, "webhooks", None)
+            if callable(wh_call):
+                res = wh_call()
+                if inspect.isawaitable(res):
+                    existing_webhooks = await res
+                elif isinstance(res, (list, tuple)):
+                    existing_webhooks = res
+        except Exception as e:
+            print(f"Could not fetch webhooks for #{getattr(target_channel, 'name', target_channel.id)}: {e}")
+            return None
+
+        bot_name = self.user.name if self.user else "LLM Bot"
+
+        # Track existing webhooks owned by the bot or matching bot naming
+        for w in existing_webhooks:
+            if getattr(w, "id", None):
+                if (self.user and getattr(w, "user", None) == self.user) or \
+                   getattr(w, "name", "") in (f"{bot_name} Webhook", "LLM Assistant", "LLM Bot Webhook") or \
+                   getattr(w, "name", "").startswith(f"{bot_name} - "):
+                    self._known_webhook_ids.add(w.id)
+
+        # If looking for a persona-specific webhook with avatar bytes
+        if prompt_name and avatar_bytes:
+            persona_wh_name = f"{bot_name} - {prompt_name}"
+            for w in existing_webhooks:
+                if getattr(w, "token", None) and getattr(w, "name", "") == persona_wh_name:
+                    if cache_key:
+                        self._persona_webhook_cache[cache_key] = w
+                    if getattr(w, "id", None):
+                        self._known_webhook_ids.add(w.id)
+                    return w, thread
+
+            # Create persona webhook with the avatar bytes
+            try:
+                wh = await target_channel.create_webhook(
+                    name=persona_wh_name,
+                    avatar=avatar_bytes,
+                    reason=f"Webhook for persona {prompt_name}"
+                )
+                if cache_key:
+                    self._persona_webhook_cache[cache_key] = wh
+                if getattr(wh, "id", None):
+                    self._known_webhook_ids.add(wh.id)
+                return wh, thread
+            except Exception as e:
+                print(f"Could not create persona webhook '{persona_wh_name}' (will use general webhook): {e}")
+
+        # Find existing general webhook
+        wh = None
+        for w in existing_webhooks:
+            if getattr(w, "token", None):
+                if self.user and getattr(w, "user", None) == self.user:
+                    wh = w
+                    break
+                if getattr(w, "name", "") in (f"{bot_name} Webhook", "LLM Assistant", "LLM Bot Webhook"):
+                    wh = w
+                    break
+
+        if not wh:
+            try:
+                wh = await target_channel.create_webhook(
+                    name=f"{bot_name} Webhook",
+                    reason="Webhook for dynamic system prompt profile avatars"
+                )
+            except Exception as e:
+                print(f"Could not create webhook in #{getattr(target_channel, 'name', target_channel.id)}: {e}")
+                return None
+
+        self._webhook_cache[target_channel.id] = wh
+        if getattr(wh, "id", None):
+            self._known_webhook_ids.add(wh.id)
+        return wh, thread
+
+    async def send_via_webhook(
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
+        username: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+        prompt_name: Optional[str] = None
+    ) -> bool:
+        """Sends a response via webhook with optional custom avatar and username. Returns True if successful."""
+        try:
+            local_avatar_bytes = None
+            local_file_path = None
+            clean_avatar_url = None
+
+            if avatar_url:
+                avatar_str = str(avatar_url).strip()
+                if avatar_str.startswith("http://") or avatar_str.startswith("https://"):
+                    clean_avatar_url = avatar_str
+                elif os.path.isfile(avatar_str):
+                    local_file_path = avatar_str
+
+            # Auto-detect image file in alternate profile pics/ if not explicitly given
+            if not clean_avatar_url and not local_file_path and prompt_name:
+                for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    candidate = os.path.join("alternate profile pics", f"{prompt_name}{ext}")
+                    if os.path.isfile(candidate):
+                        local_file_path = candidate
+                        break
+
+            # If local file, read bytes or use cached CDN url
+            if local_file_path:
+                if local_file_path in self._local_avatar_cdn_cache:
+                    clean_avatar_url = self._local_avatar_cdn_cache[local_file_path]
+                else:
+                    try:
+                        with open(local_file_path, "rb") as f:
+                            local_avatar_bytes = f.read()
+                    except Exception as e:
+                        print(f"Could not read local avatar file '{local_file_path}': {e}")
+
+            wh_info = await self.get_webhook_for_channel(
+                channel,
+                prompt_name=prompt_name if local_avatar_bytes else None,
+                avatar_bytes=local_avatar_bytes
+            )
+            if not wh_info:
+                return False
+
+            webhook, thread = wh_info
+
+            # If webhook was created with avatar, cache its permanent CDN URL
+            if local_file_path and getattr(webhook, "avatar", None) and getattr(webhook.avatar, "url", None):
+                self._local_avatar_cdn_cache[local_file_path] = webhook.avatar.url
+
+            # Fall back to bot default avatar URL if no persona avatar is provided
+            if not clean_avatar_url and not local_avatar_bytes:
+                if self.user and hasattr(self.user, "display_avatar") and self.user.display_avatar:
+                    clean_avatar_url = self.user.display_avatar.url
+
+            # Chunk content into <= 2000 chars if necessary
+            if len(content) > 2000:
+                parts = [content[i:i + 2000] for i in range(0, len(content), 2000)]
+            else:
+                parts = [content]
+
+            # Validate / sanitize username
+            clean_username = username
+            if clean_username:
+                clean_username = clean_username.strip()[:80]
+                if not clean_username or "clyde" in clean_username.lower():
+                    clean_username = None
+
+            async def _send_parts(target_wh, av):
+                kwargs = {}
+                if clean_username:
+                    kwargs["username"] = clean_username
+                if av:
+                    kwargs["avatar_url"] = av
+                if thread:
+                    kwargs["thread"] = thread
+
+                for part in parts:
+                    await target_wh.send(content=part, **kwargs)
+
+            try:
+                await _send_parts(webhook, clean_avatar_url)
+                return True
+            except discord.NotFound:
+                # Webhook might have been deleted, invalidate cache and retry once
+                target_id = getattr(channel.parent, "id", None) if isinstance(channel, discord.Thread) and getattr(channel, "parent", None) else getattr(channel, "id", None)
+                if target_id:
+                    self._webhook_cache.pop(target_id, None)
+                    if prompt_name:
+                        self._persona_webhook_cache.pop((target_id, prompt_name), None)
+                wh_info = await self.get_webhook_for_channel(
+                    channel,
+                    prompt_name=prompt_name if local_avatar_bytes else None,
+                    avatar_bytes=local_avatar_bytes
+                )
+                if not wh_info:
+                    return False
+                webhook, thread = wh_info
+                await _send_parts(webhook, clean_avatar_url)
+                return True
+            except discord.HTTPException as e:
+                # If avatar_url was rejected (e.g. invalid URL, 404), retry without avatar_url
+                if clean_avatar_url:
+                    print(f"Webhook send failed with avatar '{clean_avatar_url}' ({e}). Retrying with default avatar...")
+                    try:
+                        await _send_parts(webhook, None)
+                        return True
+                    except Exception as retry_err:
+                        print(f"Webhook retry without avatar also failed: {retry_err}")
+                        return False
+                print(f"Webhook send HTTPException: {e}")
+                return False
+        except Exception as e:
+            print(f"Unexpected error in send_via_webhook: {e}")
+            return False
+
+    async def is_bot_webhook_id(self, webhook_id: int, channel: Optional[discord.abc.Messageable] = None) -> bool:
+        """Checks if the given webhook_id belongs to this bot or was created for bot personas."""
+        if not webhook_id:
+            return False
+        if webhook_id in self._known_webhook_ids:
+            return True
+
+        target_channel = channel
+        if isinstance(channel, discord.Thread):
+            target_channel = channel.parent
+            if target_channel is None and hasattr(channel, "guild") and channel.guild:
+                try:
+                    target_channel = await channel.guild.fetch_channel(channel.parent_id)
+                except Exception:
+                    target_channel = None
+
+        if target_channel and hasattr(target_channel, "webhooks"):
+            try:
+                wh_call = getattr(target_channel, "webhooks", None)
+                webhooks = []
+                if callable(wh_call):
+                    res = wh_call()
+                    if inspect.isawaitable(res):
+                        webhooks = await res
+                    elif isinstance(res, (list, tuple)):
+                        webhooks = res
+
+                bot_name = self.user.name if self.user else "LLM Bot"
+                for w in webhooks:
+                    is_our_webhook = False
+                    if self.user and getattr(w, "user", None) == self.user:
+                        is_our_webhook = True
+                    elif getattr(w, "name", "") in (f"{bot_name} Webhook", "LLM Assistant", "LLM Bot Webhook") or getattr(w, "name", "").startswith(f"{bot_name} - "):
+                        is_our_webhook = True
+
+                    if is_our_webhook and getattr(w, "id", None):
+                        self._known_webhook_ids.add(w.id)
+                        if w.id == webhook_id:
+                            return True
+            except Exception as e:
+                print(f"Error checking webhooks in channel {getattr(target_channel, 'id', target_channel)}: {e}")
+
+        return False
 
     def load_banned_words(self) -> List[str]:
         """Loads banned words from the banned_words.json file."""
@@ -410,6 +775,7 @@ class LLMBot(commands.Bot):
             "gemini_model": self.gemini_model,
             "gemini_fallback_model": self.gemini_fallback_model,
             "gemini_timeout": self.gemini_timeout,
+            "gemini_fallback_timeout": self.gemini_fallback_timeout,
             "enable_members_intent": self.enable_members_intent,
             "run_in_background": self.run_in_background,
             "max_history": self.max_history,
@@ -452,6 +818,10 @@ class LLMBot(commands.Bot):
         if message.author == self.user:
             return
 
+        # Never respond to incoming messages sent by the bot's own webhooks
+        if getattr(message, "webhook_id", None) and await self.is_bot_webhook_id(message.webhook_id, message.channel):
+            return
+
         if await self.should_respond(message):
             status_msg = None
             try:
@@ -481,7 +851,9 @@ class LLMBot(commands.Bot):
 
                     if not is_forward_ref:
                         try:
-                            referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                            referenced_message = getattr(message.reference, "resolved", None)
+                            if not isinstance(referenced_message, discord.Message):
+                                referenced_message = await message.channel.fetch_message(message.reference.message_id)
                             
                             # Extract images from the referenced message
                             ref_images = await _extract_images_from_message(referenced_message)
@@ -492,6 +864,8 @@ class LLMBot(commands.Bot):
                             # Check if referenced message was solely an image or media link
                             ref_urls = [img.get("source_url") for img in ref_images if img.get("source_url")]
                             clean_ref_content = referenced_message.content.strip() if referenced_message.content else ""
+                            # Strip footer subtexts from bot responses (e.g., -# System prompt: ... or -# Fallback model used: ...)
+                            clean_ref_content = re.sub(r'(?m)^-#\s*(?:System prompt|Fallback model used):.*$', '', clean_ref_content).strip()
 
                             # If referenced message is a forwarded message, its caption/text may be inside its snapshots
                             if not clean_ref_content:
@@ -628,7 +1002,8 @@ class LLMBot(commands.Bot):
                     metadata=resp_metadata,
                     temperature=self.temperature,
                     fallback_model=self.gemini_fallback_model if self.llm_provider == "GEMINI" else None,
-                    timeout=self.gemini_timeout if self.llm_provider == "GEMINI" else None
+                    timeout=self.gemini_timeout if self.llm_provider == "GEMINI" else None,
+                    fallback_timeout=self.gemini_fallback_timeout if self.llm_provider == "GEMINI" else None
                 )
 
                 if llm_response:
@@ -683,13 +1058,47 @@ class LLMBot(commands.Bot):
                         used_fallback = resp_metadata.get("fallback_model") or self.gemini_fallback_model
                         discord_response = f"{discord_response.rstrip()}\n-# Fallback model used: {used_fallback}"
 
-                    if len(discord_response) > 2000:
-                        parts = [discord_response[i:i+2000] for i in range(0, len(discord_response), 2000)]
-                        await status_msg.edit(content=parts[0])
-                        for part in parts[1:]:
-                            await message.channel.send(part)
+                    # Determine profile picture and username for current prompt
+                    profile = self.get_prompt_profile(current_prompt_name)
+                    avatar_url = profile.get("avatar_url")
+                    webhook_username = profile.get("username")
+
+                    if not webhook_username and self.user:
+                        webhook_username = self.user.display_name or self.user.name
+
+                    if not avatar_url and self.user and hasattr(self.user, "display_avatar") and self.user.display_avatar:
+                        avatar_url = self.user.display_avatar.url
+
+                    sent_via_webhook = await self.send_via_webhook(
+                        channel=message.channel,
+                        content=discord_response,
+                        username=webhook_username,
+                        avatar_url=avatar_url,
+                        prompt_name=current_prompt_name
+                    )
+
+                    if sent_via_webhook:
+                        if status_msg:
+                            try:
+                                await status_msg.delete()
+                            except Exception:
+                                pass
                     else:
-                        await status_msg.edit(content=discord_response)
+                        if status_msg:
+                            if len(discord_response) > 2000:
+                                parts = [discord_response[i:i+2000] for i in range(0, len(discord_response), 2000)]
+                                await status_msg.edit(content=parts[0])
+                                for part in parts[1:]:
+                                    await message.channel.send(part)
+                            else:
+                                await status_msg.edit(content=discord_response)
+                        else:
+                            if len(discord_response) > 2000:
+                                parts = [discord_response[i:i+2000] for i in range(0, len(discord_response), 2000)]
+                                for part in parts:
+                                    await message.channel.send(part)
+                            else:
+                                await message.channel.send(discord_response)
                 else:
                     await status_msg.edit(content="⚠️ No response was received from the model.")
             
@@ -774,6 +1183,7 @@ async def info_command(interaction: discord.Interaction):
             fb_model = info.get("fallback_model") or bot.gemini_fallback_model
             embed.add_field(name="🛡️ Fallback Model", value=f"`{fb_model}`", inline=True)
             embed.add_field(name="🔄 Fallback Used", value=f"**{fallback_used_str}**", inline=True)
+            embed.add_field(name="⏱️ Timeout", value=f"Primary: `{bot.gemini_timeout}s` | Fallback: `{bot.gemini_fallback_timeout}s`", inline=True)
 
         prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
         embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
@@ -799,6 +1209,7 @@ async def info_command(interaction: discord.Interaction):
         if provider_val == "GEMINI":
             embed.add_field(name="🛡️ Fallback Model", value=f"`{bot.gemini_fallback_model}`", inline=True)
             embed.add_field(name="🔄 Fallback Used", value="*N/A (No responses yet)*", inline=True)
+            embed.add_field(name="⏱️ Timeout", value=f"Primary: `{bot.gemini_timeout}s` | Fallback: `{bot.gemini_fallback_timeout}s`", inline=True)
 
         prompt_display = sys_prompt if len(sys_prompt) <= 1000 else sys_prompt[:997] + "..."
         embed.add_field(name=f"📝 System Prompt ({prompt_name})", value=f"```{prompt_display}```", inline=False)
@@ -922,8 +1333,21 @@ async def list_prompts(interaction: discord.Interaction):
         return
     embed = discord.Embed(title="Available System Prompts", color=discord.Color.blue())
     for name, content in bot.prompts.items():
-        embed.add_field(name=name, value=f"```{content[:100]}...```", inline=False)
+        profile = bot.get_prompt_profile(name)
+        pfp_info = " (🖼️ custom avatar)" if profile.get("avatar_url") else ""
+        embed.add_field(name=f"{name}{pfp_info}", value=f"```{content[:100]}...```", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@app_commands.command(name="reloadprompts", description="Reloads system prompts and profile pictures from prompts.json.")
+async def reload_prompts_command(interaction: discord.Interaction):
+    bot = interaction.client
+    bot.reload_prompts()
+    count = len(bot.prompts)
+    pfp_count = sum(1 for p in bot.prompt_profiles.values() if p.get("avatar_url"))
+    await interaction.response.send_message(
+        f"✅ Successfully reloaded {count} system prompts ({pfp_count} with custom profile pictures) from `prompts.json`.",
+        ephemeral=True
+    )
 
 @app_commands.command(name="temp", description="Set the model temperature between 0.0 and 2.0 (Admin only).")
 @app_commands.describe(value="Temperature value between 0.0 and 2.0. Default is 0.7.")
@@ -971,22 +1395,51 @@ async def fallback_model_command_autocomplete(interaction: discord.Interaction, 
         choices.insert(0, app_commands.Choice(name=f"Custom: {current}", value=current))
     return choices[:25]
 
-@app_commands.command(name="timeout", description="Set the Gemini request timeout in seconds (Admin only).")
-@app_commands.describe(seconds="Timeout in seconds (e.g. 30.0). Default is 30.0.")
+@app_commands.command(name="timeout", description="Set the Gemini request timeouts in seconds (Admin only).")
+@app_commands.describe(
+    seconds="Primary model timeout in seconds (1.0 - 300.0).",
+    fallback_seconds="Optional fallback model timeout in seconds (1.0 - 300.0)."
+)
 @app_commands.default_permissions(administrator=True)
-async def timeout_command(interaction: discord.Interaction, seconds: float):
+async def timeout_command(interaction: discord.Interaction, seconds: float, fallback_seconds: Optional[float] = None):
     if interaction.guild and not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You do not have permission to use this command (Administrator required).", ephemeral=True)
         return
 
-    if seconds < 5.0 or seconds > 300.0:
-        await interaction.response.send_message("❌ Timeout must be between 5.0 and 300.0 seconds.", ephemeral=True)
+    if seconds < 1.0 or seconds > 300.0:
+        await interaction.response.send_message("❌ Timeout must be between 1.0 and 300.0 seconds.", ephemeral=True)
         return
 
     bot = interaction.client
     bot.gemini_timeout = round(seconds, 1)
+    msg = f"✅ Gemini primary timeout updated to **{bot.gemini_timeout}s**."
+
+    if fallback_seconds is not None:
+        if fallback_seconds < 1.0 or fallback_seconds > 300.0:
+            await interaction.response.send_message("❌ Fallback timeout must be between 1.0 and 300.0 seconds.", ephemeral=True)
+            return
+        bot.gemini_fallback_timeout = round(fallback_seconds, 1)
+        msg += f" Fallback timeout updated to **{bot.gemini_fallback_timeout}s**."
+
     bot.save_settings()
-    await interaction.response.send_message(f"✅ Gemini timeout updated to **{bot.gemini_timeout}s**.", ephemeral=True)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@app_commands.command(name="fallbacktimeout", description="Set the Gemini fallback model request timeout in seconds (Admin only).")
+@app_commands.describe(seconds="Timeout in seconds for the fallback Gemini model (1.0 - 300.0).")
+@app_commands.default_permissions(administrator=True)
+async def fallback_timeout_command(interaction: discord.Interaction, seconds: float):
+    if interaction.guild and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You do not have permission to use this command (Administrator required).", ephemeral=True)
+        return
+
+    if seconds < 1.0 or seconds > 300.0:
+        await interaction.response.send_message("❌ Timeout must be between 1.0 and 300.0 seconds.", ephemeral=True)
+        return
+
+    bot = interaction.client
+    bot.gemini_fallback_timeout = round(seconds, 1)
+    bot.save_settings()
+    await interaction.response.send_message(f"✅ Gemini fallback timeout updated to **{bot.gemini_fallback_timeout}s**.", ephemeral=True)
 
 @app_commands.command(name="help", description="Shows the list of available commands.")
 async def help_command(interaction: discord.Interaction):
@@ -994,7 +1447,8 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="/provider [LM Studio|Gemini]", value="Switches the active LLM provider (Admin only). Alias: `/source`.", inline=False)
     embed.add_field(name="/model [name]", value="Changes the active model name (Admin only).", inline=False)
     embed.add_field(name="/fallbackmodel [name]", value="Changes the Gemini fallback model (Admin only). Default: `gemini-2.5-flash-lite`.", inline=False)
-    embed.add_field(name="/timeout [seconds]", value="Sets the Gemini request timeout in seconds (Admin only). Default: `30.0`.", inline=False)
+    embed.add_field(name="/timeout [seconds] [fallback_seconds]", value="Sets the primary and optional fallback Gemini timeouts in seconds (Admin only).", inline=False)
+    embed.add_field(name="/fallbacktimeout [seconds]", value="Sets the fallback Gemini model timeout in seconds (Admin only).", inline=False)
     embed.add_field(name="/temp [0.0 - 2.0]", value="Sets the model temperature between 0.0 and 2.0 (Admin only). Default is 0.7.", inline=False)
     embed.add_field(name="/setprompt [name|custom]", value="Sets the bot's system prompt. This disables random mode.", inline=False)
     embed.add_field(name="/info", value="Displays details about the last response generated and active configuration.", inline=False)
@@ -1002,6 +1456,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="/think [True|False]", value="Toggles whether the bot shows its thought process (LM Studio only).", inline=False)
     embed.add_field(name="/grounding [True|False]", value="Toggles whether the bot uses web search grounding (DuckDuckGo + Jina Reader).", inline=False)
     embed.add_field(name="/listprompts", value="Lists all available preset prompts.", inline=False)
+    embed.add_field(name="/reloadprompts", value="Reloads system prompts and profile pictures from prompts.json.", inline=False)
     embed.add_field(name="/clearhistory", value="Clears the conversation history for this channel.", inline=False)
     embed.add_field(name="/help", value="Shows this help message.", inline=False)
     embed.add_field(name="Mention the bot (@BotName)", value="Ask the bot a question directly by mentioning it.", inline=False)
@@ -1024,10 +1479,12 @@ async def setup(bot: commands.Bot):
     bot.tree.add_command(model_command)
     bot.tree.add_command(fallback_model_command)
     bot.tree.add_command(timeout_command)
+    bot.tree.add_command(fallback_timeout_command)
     bot.tree.add_command(temp_command)
     bot.tree.add_command(setprompt)
     bot.tree.add_command(info_command)
     bot.tree.add_command(list_prompts)
+    bot.tree.add_command(reload_prompts_command)
     bot.tree.add_command(help_command)
     bot.tree.add_command(random_command)
     bot.tree.add_command(think_command)
